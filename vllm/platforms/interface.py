@@ -615,6 +615,15 @@ class Platform:
         """
         return max_model_len
 
+    @classmethod
+    def get_forward_context_manager(cls):
+        """
+        Return forward context manager by the current platform.
+        """
+        from vllm.forward_context import set_forward_context
+
+        return set_forward_context
+
 
 class UnspecifiedPlatform(Platform):
     _enum = PlatformEnum.UNSPECIFIED
