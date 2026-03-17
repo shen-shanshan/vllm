@@ -38,6 +38,11 @@ class BudgetGraphMetadata:
     metadata_buffers: dict[str, torch.Tensor]
     # Output written by graph, read after replay
     output_buffer: torch.Tensor
+    # Maximum number of attention sequences (cu_seqlens segments) that
+    # this graph was captured with.  For image this equals max_batch_size
+    # (t=1 always).  For video this is max_batch_size * t_capture and acts
+    # as an upper-bound check before replay.
+    max_num_seqs: int = 0
 
 
 class EncoderCudaGraphManager:
@@ -69,7 +74,9 @@ class EncoderCudaGraphManager:
             and vllm_config.parallel_config.tensor_parallel_size > 1
         )
 
-        self.budget_graphs: dict[int, BudgetGraphMetadata] = {}
+        self.budget_graphs: dict[str, dict[int, BudgetGraphMetadata]] = {
+            m: {} for m in self.config.modalities
+        }
         self.graph_hits = 0
         self.graph_misses = 0
         self.log_stats_interval = 100
@@ -86,30 +93,60 @@ class EncoderCudaGraphManager:
         """Check if a modality is supported by this manager."""
         return modality in self.config.modalities
 
+    def _get_input_key(self, modality: str) -> str:
+        """Return the mm_kwargs key for the main input tensor of a modality."""
+        if self.config.modality_input_keys:
+            return self.config.modality_input_keys.get(modality, self.config.input_key)
+        return self.config.input_key
+
+    def _detect_modality(self, mm_kwargs: dict[str, Any]) -> str:
+        """Infer modality from mm_kwargs keys.
+
+        Checks for the presence of modality-specific input keys as registered
+        in ``config.modality_input_keys``.  Falls back to the first supported
+        modality when no match is found.
+        """
+        if self.config.modality_input_keys:
+            for modality, key in self.config.modality_input_keys.items():
+                if key in mm_kwargs:
+                    return modality
+        # Fallback: first registered modality
+        return self.config.modalities[0]
+
     def capture(self):
-        """Capture CUDA graphs for all token budgets."""
-        for token_budget in self.token_budgets:
-            self._capture_budget_graph(token_budget)
+        """Capture CUDA graphs for all modalities and token budgets."""
+        total = 0
+        for modality in self.config.modalities:
+            for token_budget in self.token_budgets:
+                self._capture_budget_graph(modality, token_budget)
+                total += 1
 
         logger.info(
-            "Encoder CUDA graph capture complete. Captured %d budget graphs.",
-            len(self.budget_graphs),
+            "Encoder CUDA graph capture complete. "
+            "Captured %d budget graphs across %d modality/ies.",
+            total,
+            len(self.config.modalities),
         )
 
-    def _capture_budget_graph(self, token_budget: int):
-        """Capture CUDA graph for a single token budget."""
+    def _capture_budget_graph(self, modality: str, token_budget: int):
+        """Capture CUDA graph for a single (modality, token_budget) pair."""
         logger.debug(
-            "Capturing encoder cudagraph for budget=%d, max_batch_size=%d",
+            "Capturing encoder cudagraph for modality=%s, budget=%d, "
+            "max_batch_size=%d",
+            modality,
             token_budget,
             self.max_batch_size,
         )
 
         capture_inputs = self.model.prepare_encoder_cudagraph_capture_inputs(
-            token_budget, self.max_batch_size, self.device, self.dtype
+            token_budget, self.max_batch_size, self.device, self.dtype, modality
         )
 
         mm_kwargs = capture_inputs.mm_kwargs
         buffers = capture_inputs.buffers
+        # max_num_seqs is reported by the model so that the manager can
+        # reject replay batches that exceed the captured cu_seqlens size.
+        max_num_seqs = capture_inputs.max_num_seqs
 
         with torch.inference_mode():
             output = self.model.encoder_cudagraph_forward(mm_kwargs, buffers)
@@ -120,14 +157,15 @@ class EncoderCudaGraphManager:
             output = self.model.encoder_cudagraph_forward(mm_kwargs, buffers)
             output_buffer.copy_(output)
 
-        input_key = self.config.input_key
-        self.budget_graphs[token_budget] = BudgetGraphMetadata(
+        input_key = self._get_input_key(modality)
+        self.budget_graphs[modality][token_budget] = BudgetGraphMetadata(
             token_budget=token_budget,
             max_batch_size=self.max_batch_size,
             graph=graph,
             input_buffer=mm_kwargs[input_key],
             metadata_buffers=buffers,
             output_buffer=output_buffer,
+            max_num_seqs=max_num_seqs,
         )
 
     def _find_smallest_fitting_budget_given_tokens(
@@ -168,32 +206,54 @@ class EncoderCudaGraphManager:
 
     def _run_budget_graph(
         self,
+        modality: str,
         mm_kwargs: dict[str, Any],
         token_budget: int,
         replay_buffers: dict[str, torch.Tensor | None],
+        actual_num_seqs: int,
     ) -> torch.Tensor | None:
         """Execute budget graph.
 
         Args:
+            modality: Modality of the current batch ("image" or "video").
             mm_kwargs: Multimodal inputs for the batch.
             token_budget: Token budget to use.
             replay_buffers: Buffer values to copy into captured buffers.
                 None values leave the corresponding buffer unchanged.
+            actual_num_seqs: Total number of attention sequences in the
+                current batch.  For image this equals the number of items
+                (t=1 always); for video it is sum(t for each video).  If
+                this exceeds the graph's max_num_seqs the replay is skipped
+                and None is returned (caller falls back to eager).
 
         Returns:
-            Encoder outputs, or None if graph not captured.
+            Encoder outputs, or None if graph not captured or batch does not
+            fit the captured constraints.
         """
         num_items = self.model.get_encoder_cudagraph_num_items(mm_kwargs)
-        if token_budget not in self.budget_graphs:
+        modality_graphs = self.budget_graphs.get(modality, {})
+        if token_budget not in modality_graphs:
             self.graph_misses += num_items
             return None
 
-        graph_meta = self.budget_graphs[token_budget]
+        graph_meta = modality_graphs[token_budget]
+
+        # Reject replays whose cu_seqlens would overflow the captured buffer.
+        if graph_meta.max_num_seqs > 0 and actual_num_seqs > graph_meta.max_num_seqs:
+            logger.debug(
+                "Encoder CUDA graph replay skipped for modality=%s: "
+                "actual_num_seqs=%d exceeds captured max_num_seqs=%d",
+                modality,
+                actual_num_seqs,
+                graph_meta.max_num_seqs,
+            )
+            self.graph_misses += num_items
+            return None
 
         # Copy the input tensor. Buffers are sized for the full budget;
         # actual inputs may be smaller. Zero then slice-copy so padded
         # positions are invisible to attention (cu_seqlens masks them out).
-        input_key = self.config.input_key
+        input_key = self._get_input_key(modality)
         src = mm_kwargs[input_key]
         n = src.shape[0]
         graph_meta.input_buffer.zero_()
@@ -223,23 +283,27 @@ class EncoderCudaGraphManager:
     ) -> list[torch.Tensor]:
         """Execute encoder on local inputs using greedy-packed CUDA graphs.
 
-        Sort images by output token count (smallest first), then greedily pack
-        as many images as possible into each batch while staying within
-        max_budget tokens and max_batch_size. Once a batch is finalised (next
-        image would overflow either constraint), find the smallest fitting
-        budget once for that batch.
+        Sort images/videos by output token count (smallest first), then
+        greedily pack as many items as possible into each batch while staying
+        within max_budget tokens and max_batch_size. Once a batch is
+        finalised (next item would overflow either constraint), find the
+        smallest fitting budget once for that batch.
 
         By exchange argument, greedy smallest-first packing minimises eager
-        fallbacks -- any other ordering yields a higher token sum in some batch,
-        making that batch more likely to exceed the budget.
+        fallbacks -- any other ordering yields a higher token sum in some
+        batch, making that batch more likely to exceed the budget.
 
         Stats note:
-          graph_hits  -- counted inside _run_budget_graph after successful replay.
-          graph_misses -- counted here for single-image batches where the image
-                         exceeds max_budget. Batches split due to max_batch_size
-                         always satisfy total_tokens <= max_budget and therefore
-                         always find a valid budget (no miss).
+          graph_hits  -- counted inside _run_budget_graph after successful
+                         replay.
+          graph_misses -- counted here for single-item batches where the item
+                         exceeds max_budget, and inside _run_budget_graph for
+                         temporal overflow (video only).  Batches split due to
+                         max_batch_size always satisfy total_tokens <=
+                         max_budget and therefore always find a valid budget
+                         (no budget miss).
         """
+        modality = self._detect_modality(mm_kwargs)
         num_items = self.model.get_encoder_cudagraph_num_items(mm_kwargs)
         max_budget = self.token_budgets[-1]
 
@@ -250,7 +314,7 @@ class EncoderCudaGraphManager:
 
         # Greedy pack against max_budget and max_batch_size.
         # _find_smallest_fitting_budget_given_tokens is called once per
-        # finalised batch, not per image.
+        # finalised batch, not per item.
         batches: list[tuple[list[int], int | None]] = []
         current_batch: list[int] = []
         current_batch_tokens = 0
@@ -286,8 +350,8 @@ class EncoderCudaGraphManager:
                 )
             )
 
-        # outputs_by_orig_idx maps each original image index to its output
-        # tensor. Needed because greedy packing reorders images; we restore
+        # outputs_by_orig_idx maps each original item index to its output
+        # tensor. Needed because greedy packing reorders items; we restore
         # the original order before returning.
         outputs_by_orig_idx: dict[int, torch.Tensor] = {}
 
@@ -298,13 +362,14 @@ class EncoderCudaGraphManager:
             batch_out_tokens = sum(per_item_out_tokens[i] for i in batch_orig_indices)
 
             if token_budget is None:
-                # Single oversized image: item_tokens > max_budget.
+                # Single oversized item: item_tokens > max_budget.
                 # graph_misses counted here for this eager fallback.
                 logger.debug(
                     "Encoder CUDA graph fallback to eager: no budget for "
-                    "%d tokens from %d images",
+                    "%d tokens from %d %s(s)",
                     batch_out_tokens,
                     len(batch_orig_indices),
+                    modality,
                 )
                 self.graph_misses += len(batch_orig_indices)
                 with torch.inference_mode():
@@ -316,30 +381,69 @@ class EncoderCudaGraphManager:
                     outputs_by_orig_idx,
                 )
             else:
+                replay = self.model.prepare_encoder_cudagraph_replay_buffers(
+                    batch_mm_kwargs, self.max_batch_size
+                )
+
+                # replay.fits is False when the batch exceeds temporal
+                # constraints captured in the graph (video only).
+                if not replay.fits:
+                    logger.debug(
+                        "Encoder CUDA graph fallback to eager: "
+                        "batch does not fit captured constraints "
+                        "(modality=%s, budget=%d)",
+                        modality,
+                        token_budget,
+                    )
+                    self.graph_misses += len(batch_orig_indices)
+                    with torch.inference_mode():
+                        raw = self.model.encoder_eager_forward(batch_mm_kwargs)
+                    self._scatter_output_slices(
+                        raw,
+                        batch_orig_indices,
+                        per_item_out_tokens,
+                        outputs_by_orig_idx,
+                    )
+                    continue
+
+                actual_num_seqs = self.model.get_encoder_cudagraph_num_seqs(
+                    batch_mm_kwargs
+                )
+
                 logger.debug(
-                    "Encoder CUDA graph: batch_size=%d, tokens=%d, "
-                    "budget=%d, waste=%.1f%%",
+                    "Encoder CUDA graph: modality=%s, batch_size=%d, "
+                    "tokens=%d, budget=%d, waste=%.1f%%",
+                    modality,
                     len(batch_orig_indices),
                     batch_out_tokens,
                     token_budget,
                     (token_budget - batch_out_tokens) / token_budget * 100,
                 )
-                replay = self.model.prepare_encoder_cudagraph_replay_buffers(
-                    batch_mm_kwargs, self.max_batch_size
-                )
 
                 # graph_hits counted inside _run_budget_graph after replay.
                 output = self._run_budget_graph(
-                    batch_mm_kwargs, token_budget, replay.buffers
+                    modality, batch_mm_kwargs, token_budget, replay.buffers,
+                    actual_num_seqs
                 )
-                assert output is not None
-                self._scatter_output_slices(
-                    output,
-                    batch_orig_indices,
-                    per_item_out_tokens,
-                    outputs_by_orig_idx,
-                    clone=True,
-                )
+                if output is None:
+                    # Budget graph not found or num_seqs overflow (video).
+                    # Fall back to eager.
+                    with torch.inference_mode():
+                        raw = self.model.encoder_eager_forward(batch_mm_kwargs)
+                    self._scatter_output_slices(
+                        raw,
+                        batch_orig_indices,
+                        per_item_out_tokens,
+                        outputs_by_orig_idx,
+                    )
+                else:
+                    self._scatter_output_slices(
+                        output,
+                        batch_orig_indices,
+                        per_item_out_tokens,
+                        outputs_by_orig_idx,
+                        clone=True,
+                    )
 
         # Return in original batch order (caller maps outputs to token positions)
         return [outputs_by_orig_idx[i] for i in range(num_items)]
@@ -540,10 +644,14 @@ class EncoderCudaGraphManager:
         total_requests = self.graph_hits + self.graph_misses
         hit_rate = self.graph_hits / total_requests if total_requests > 0 else 0.0
 
+        num_budgets_per_modality = {
+            m: len(graphs) for m, graphs in self.budget_graphs.items()
+        }
         return {
             "graph_hits": self.graph_hits,
             "graph_misses": self.graph_misses,
             "hit_rate": hit_rate,
-            "num_budgets": len(self.budget_graphs),
+            "num_budgets": sum(num_budgets_per_modality.values()),
+            "num_budgets_per_modality": num_budgets_per_modality,
             "token_budgets": self.token_budgets,
         }

@@ -40,7 +40,8 @@ def _make_manager_with_budgets(budgets: list[int]) -> EncoderCudaGraphManager:
     mgr.token_budgets = sorted(budgets)
     mgr.max_batch_size = 16
     mgr.use_dp = False
-    mgr.budget_graphs = {}
+    # budget_graphs is now keyed by modality
+    mgr.budget_graphs = {"image": {}}
     mgr.graph_hits = 0
     mgr.graph_misses = 0
     mgr.log_stats_interval = 100
@@ -198,6 +199,13 @@ class SimpleMockViTModel(torch.nn.Module):
         m = _SPATIAL_MERGE
         return [t * (h // m) * (w // m) for t, h, w in mm_kwargs["image_grid_thw"]]
 
+    def get_encoder_cudagraph_num_seqs(
+        self,
+        mm_kwargs: dict[str, Any],
+    ) -> int:
+        # Images always have t=1; return number of items.
+        return len(mm_kwargs["image_grid_thw"])
+
     def get_encoder_cudagraph_per_item_input_sizes(
         self,
         mm_kwargs: dict[str, Any],
@@ -238,6 +246,7 @@ class SimpleMockViTModel(torch.nn.Module):
         max_batch_size: int,
         device: torch.device,
         dtype: torch.dtype,
+        modality: str = "image",
     ) -> EncoderCudaGraphCaptureInputs:
         per_image_output = token_budget // max_batch_size
         grid_config = [
@@ -301,7 +310,7 @@ def _make_manager_for_gpu(
     mgr.token_budgets = sorted(token_budgets)
     mgr.max_batch_size = max_batch_size
     mgr.use_dp = False
-    mgr.budget_graphs = {}
+    mgr.budget_graphs = {"image": {}}
     mgr.graph_hits = 0
     mgr.graph_misses = 0
     mgr.log_stats_interval = 100
@@ -353,8 +362,8 @@ class TestEncoderCudaGraphCaptureReplay:
     # --- capture ---
 
     def test_capture_creates_one_graph_per_budget(self):
-        assert len(self.mgr.budget_graphs) == len(_BUDGETS)
-        assert set(self.mgr.budget_graphs.keys()) == set(_BUDGETS)
+        assert len(self.mgr.budget_graphs["image"]) == len(_BUDGETS)
+        assert set(self.mgr.budget_graphs["image"].keys()) == set(_BUDGETS)
 
     # --- output shape ---
 

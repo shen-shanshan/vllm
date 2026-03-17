@@ -1521,7 +1521,22 @@ class SupportsEncoderCudaGraph(Protocol):
         self,
         mm_kwargs: dict[str, Any],
     ) -> int:
-        """Return the number of items (e.g. images) in the batch."""
+        """Return the number of items (e.g. images or videos) in the batch."""
+        ...
+
+    def get_encoder_cudagraph_num_seqs(
+        self,
+        mm_kwargs: dict[str, Any],
+    ) -> int:
+        """Return the total number of attention sequences in the batch.
+
+        For images (t=1 always) this equals ``get_encoder_cudagraph_num_items``.
+        For videos each item contributes ``t`` temporal sequences, so this
+        returns ``sum(t for t, h, w in video_grid_thw)``.
+
+        Used by the manager to verify that the cu_seqlens buffer captured
+        at graph-capture time is large enough for the current replay batch.
+        """
         ...
 
     def get_encoder_cudagraph_per_item_output_tokens(
@@ -1568,8 +1583,18 @@ class SupportsEncoderCudaGraph(Protocol):
         max_batch_size: int,
         device: torch.device,
         dtype: torch.dtype,
+        modality: str = "image",
     ) -> "EncoderCudaGraphCaptureInputs":
-        """Create dummy inputs and buffers for CUDA graph capture."""
+        """Create dummy inputs and buffers for CUDA graph capture.
+
+        Args:
+            token_budget: Total output token budget for this graph.
+            max_batch_size: Maximum number of items (images/videos) per batch.
+            device: Device to allocate tensors on.
+            dtype: Dtype for pixel value tensors.
+            modality: Modality to capture ("image" or "video").  Defaults to
+                "image" for backward compatibility with single-modality models.
+        """
         ...
 
     def prepare_encoder_cudagraph_replay_buffers(

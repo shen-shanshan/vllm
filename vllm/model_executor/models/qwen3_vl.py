@@ -1567,13 +1567,21 @@ class Qwen3VLForConditionalGeneration(
 
     # -- SupportsEncoderCudaGraph protocol methods --
 
+    # Maximum temporal grid dimension (t in grid_thw) for video CUDA graph
+    # capture.  Videos with t <= this value use CUDA graphs; longer videos
+    # fall back to eager execution.
+    # t = ceil(num_frames / temporal_patch_size), so with the default
+    # temporal_patch_size=2 this covers up to 2 * _VIDEO_CUDAGRAPH_T_CAPTURE
+    # raw frames (e.g. 16 raw frames with the default value of 8).
+    _VIDEO_CUDAGRAPH_T_CAPTURE: int = 8
+
     def get_encoder_cudagraph_config(self):
         from vllm.v1.worker.gpu.mm.encoder_cudagraph_defs import (
             EncoderCudaGraphConfig,
         )
 
         return EncoderCudaGraphConfig(
-            modalities=["image"],
+            modalities=["image", "video"],
             input_key="pixel_values",
             buffer_keys=[
                 "pos_embeds",
@@ -1584,39 +1592,74 @@ class Qwen3VLForConditionalGeneration(
                 "sequence_lengths",
             ],
             out_hidden_size=self.visual.out_hidden_size,
+            modality_input_keys={
+                "image": "pixel_values",
+                "video": "pixel_values_videos",
+            },
+        )
+
+    @staticmethod
+    def _get_grid_thw_key(mm_kwargs: dict[str, Any]) -> str:
+        """Return the grid_thw key based on which modality is in mm_kwargs."""
+        return "video_grid_thw" if "video_grid_thw" in mm_kwargs else "image_grid_thw"
+
+    @staticmethod
+    def _get_pixel_values_key(mm_kwargs: dict[str, Any]) -> str:
+        """Return the pixel values key based on which modality is in mm_kwargs."""
+        return (
+            "pixel_values_videos"
+            if "pixel_values_videos" in mm_kwargs
+            else "pixel_values"
         )
 
     def get_encoder_cudagraph_num_items(
         self,
         mm_kwargs: dict[str, Any],
     ) -> int:
-        return len(mm_kwargs["image_grid_thw"])
+        grid_key = self._get_grid_thw_key(mm_kwargs)
+        return len(mm_kwargs[grid_key])
+
+    def get_encoder_cudagraph_num_seqs(
+        self,
+        mm_kwargs: dict[str, Any],
+    ) -> int:
+        """Return total attention sequences: sum(t) for each grid entry.
+
+        For images t=1 always, so this equals the number of images.
+        For videos t >= 1 depending on the number of sampled frames.
+        """
+        grid_key = self._get_grid_thw_key(mm_kwargs)
+        return sum(t for t, h, w in mm_kwargs[grid_key])
 
     def get_encoder_cudagraph_per_item_output_tokens(
         self,
         mm_kwargs: dict[str, Any],
     ) -> list[int]:
         m = self.visual.spatial_merge_size
-        return [t * (h // m) * (w // m) for t, h, w in mm_kwargs["image_grid_thw"]]
+        grid_key = self._get_grid_thw_key(mm_kwargs)
+        return [t * (h // m) * (w // m) for t, h, w in mm_kwargs[grid_key]]
 
     def get_encoder_cudagraph_per_item_input_sizes(
         self,
         mm_kwargs: dict[str, Any],
     ) -> list[int]:
-        return [t * h * w for t, h, w in mm_kwargs["image_grid_thw"]]
+        grid_key = self._get_grid_thw_key(mm_kwargs)
+        return [t * h * w for t, h, w in mm_kwargs[grid_key]]
 
     def select_encoder_cudagraph_items(
         self,
         mm_kwargs: dict[str, Any],
         indices: list[int],
     ) -> dict[str, Any]:
-        grid_thw = mm_kwargs["image_grid_thw"]
-        pixel_values = mm_kwargs["pixel_values"]
+        grid_key = self._get_grid_thw_key(mm_kwargs)
+        pv_key = self._get_pixel_values_key(mm_kwargs)
+        grid_thw = mm_kwargs[grid_key]
+        pixel_values = mm_kwargs[pv_key]
 
         if len(indices) == 0:
             return {
-                "pixel_values": pixel_values[:0],
-                "image_grid_thw": [],
+                pv_key: pixel_values[:0],
+                grid_key: [],
             }
 
         # Compute cumulative patch offsets for slicing pixel_values
@@ -1631,8 +1674,8 @@ class Qwen3VLForConditionalGeneration(
         selected_grid = [grid_thw[i] for i in indices]
 
         return {
-            "pixel_values": selected_pv,
-            "image_grid_thw": selected_grid,
+            pv_key: selected_pv,
+            grid_key: selected_grid,
         }
 
     def prepare_encoder_cudagraph_capture_inputs(
@@ -1641,54 +1684,85 @@ class Qwen3VLForConditionalGeneration(
         max_batch_size: int,
         device: torch.device,
         dtype: torch.dtype,
+        modality: str = "image",
     ):
         from vllm.v1.worker.gpu.mm.encoder_cudagraph_defs import (
             EncoderCudaGraphCaptureInputs,
         )
 
         spatial_merge_size = self.visual.spatial_merge_size
-        per_image_output = token_budget // max_batch_size
-
-        # Synthetic rectangular grid: [1, merge, per_image_output * merge]
-        # produces exactly per_image_output tokens per image.
-        grid_config = [
-            [1, spatial_merge_size, per_image_output * spatial_merge_size]
-            for _ in range(max_batch_size)
-        ]
-
-        # Create dummy pixel_values
         patch_embed = self.visual.patch_embed
         in_channels = patch_embed.proj.in_channels
         patch_size = patch_embed.patch_size
         temporal_patch_size = patch_embed.temporal_patch_size
-        total_patches = sum(t * h * w for t, h, w in grid_config)
         flattened_patch_size = (
             in_channels * temporal_patch_size * patch_size * patch_size
         )
-        dummy_pixel_values = torch.randn(
-            total_patches, flattened_patch_size, device=device, dtype=dtype
-        )
 
-        # Override max_seqlen with a safe upper bound for capture.
-        # max_seqlen.item() gets baked into the CUDA graph (not replayed),
-        # so the capture value must cover any replay scenario.
-        # Worst case: 1 image consuming the full budget ->
-        # seq_len = token_budget * spatial_merge_size^2.
-        buffers = self.visual.prepare_encoder_metadata(
-            grid_config,
-            max_batch_size=max_batch_size,
-            max_seqlen_override=token_budget * (spatial_merge_size**2),
-            device=device,
-        )
-
-        mm_kwargs = {
-            "pixel_values": dummy_pixel_values,
-            "image_grid_thw": grid_config,
-        }
+        if modality == "video":
+            # Use a fixed temporal dimension for video capture.
+            # Videos with t > _VIDEO_CUDAGRAPH_T_CAPTURE will fall back to
+            # eager at replay time (checked via max_num_seqs).
+            t_capture = self._VIDEO_CUDAGRAPH_T_CAPTURE
+            per_video_output = token_budget // max_batch_size
+            # Distribute budget across temporal frames; ensure at least 1
+            # spatial token per temporal position.
+            per_frame_spatial = max(1, per_video_output // t_capture)
+            grid_config = [
+                [t_capture, spatial_merge_size, per_frame_spatial * spatial_merge_size]
+                for _ in range(max_batch_size)
+            ]
+            # max_num_seqs = total temporal frames across all videos at capture
+            max_num_seqs = max_batch_size * t_capture
+            total_patches = sum(t * h * w for t, h, w in grid_config)
+            dummy_pixel_values = torch.randn(
+                total_patches, flattened_patch_size, device=device, dtype=dtype
+            )
+            # Pad cu_seqlens to max_num_seqs (total temporal frames, not videos)
+            buffers = self.visual.prepare_encoder_metadata(
+                grid_config,
+                max_batch_size=max_num_seqs,
+                max_seqlen_override=token_budget * (spatial_merge_size**2),
+                device=device,
+            )
+            mm_kwargs: dict[str, Any] = {
+                "pixel_values_videos": dummy_pixel_values,
+                "video_grid_thw": grid_config,
+            }
+        else:
+            # Image capture (original logic)
+            per_image_output = token_budget // max_batch_size
+            # Synthetic rectangular grid: [1, merge, per_image_output * merge]
+            # produces exactly per_image_output tokens per image.
+            grid_config = [
+                [1, spatial_merge_size, per_image_output * spatial_merge_size]
+                for _ in range(max_batch_size)
+            ]
+            max_num_seqs = max_batch_size  # t=1 for all images
+            total_patches = sum(t * h * w for t, h, w in grid_config)
+            dummy_pixel_values = torch.randn(
+                total_patches, flattened_patch_size, device=device, dtype=dtype
+            )
+            # Override max_seqlen with a safe upper bound for capture.
+            # max_seqlen.item() gets baked into the CUDA graph (not replayed),
+            # so the capture value must cover any replay scenario.
+            # Worst case: 1 image consuming the full budget ->
+            # seq_len = token_budget * spatial_merge_size^2.
+            buffers = self.visual.prepare_encoder_metadata(
+                grid_config,
+                max_batch_size=max_num_seqs,
+                max_seqlen_override=token_budget * (spatial_merge_size**2),
+                device=device,
+            )
+            mm_kwargs = {
+                "pixel_values": dummy_pixel_values,
+                "image_grid_thw": grid_config,
+            }
 
         return EncoderCudaGraphCaptureInputs(
             mm_kwargs=mm_kwargs,
             buffers=buffers,
+            max_num_seqs=max_num_seqs,
         )
 
     def prepare_encoder_cudagraph_replay_buffers(
@@ -1700,12 +1774,30 @@ class Qwen3VLForConditionalGeneration(
             EncoderCudaGraphReplayBuffers,
         )
 
-        grid_thw_list = mm_kwargs["image_grid_thw"]
+        grid_key = self._get_grid_thw_key(mm_kwargs)
+        grid_thw_list = mm_kwargs[grid_key]
 
-        buffers = self.visual.prepare_encoder_metadata(
-            grid_thw_list,
-            max_batch_size=max_batch_size,
-        )
+        if grid_key == "video_grid_thw":
+            # For video, max_batch_size is the number of videos.
+            # cu_seqlens has one entry per temporal frame across all videos.
+            # The captured graph was built with max_num_seqs =
+            # max_batch_size * _VIDEO_CUDAGRAPH_T_CAPTURE sequences.
+            # Reject batches that exceed this bound.
+            actual_total_seqs = sum(t for t, h, w in grid_thw_list)
+            max_seqs_for_capture = max_batch_size * self._VIDEO_CUDAGRAPH_T_CAPTURE
+            if actual_total_seqs > max_seqs_for_capture:
+                return EncoderCudaGraphReplayBuffers(buffers={}, fits=False)
+            # Pad cu_seqlens to the captured size for consistent buffer layout.
+            buffers = self.visual.prepare_encoder_metadata(
+                grid_thw_list,
+                max_batch_size=max_seqs_for_capture,
+            )
+        else:
+            # Image: each image contributes exactly 1 sequence (t=1).
+            buffers = self.visual.prepare_encoder_metadata(
+                grid_thw_list,
+                max_batch_size=max_batch_size,
+            )
 
         return EncoderCudaGraphReplayBuffers(buffers=buffers)
 
@@ -1714,16 +1806,20 @@ class Qwen3VLForConditionalGeneration(
         mm_kwargs: dict[str, Any],
         buffers: dict[str, torch.Tensor],
     ) -> torch.Tensor:
-        pixel_values = mm_kwargs["pixel_values"]
-        grid_thw = mm_kwargs["image_grid_thw"]
+        pv_key = self._get_pixel_values_key(mm_kwargs)
+        grid_key = self._get_grid_thw_key(mm_kwargs)
+        pixel_values = mm_kwargs[pv_key]
+        grid_thw = mm_kwargs[grid_key]
         return self.visual(pixel_values, grid_thw, encoder_metadata=buffers)
 
     def encoder_eager_forward(
         self,
         mm_kwargs: dict[str, Any],
     ) -> torch.Tensor:
-        pixel_values = mm_kwargs["pixel_values"]
-        grid_thw = mm_kwargs["image_grid_thw"]
+        pv_key = self._get_pixel_values_key(mm_kwargs)
+        grid_key = self._get_grid_thw_key(mm_kwargs)
+        pixel_values = mm_kwargs[pv_key]
+        grid_thw = mm_kwargs[grid_key]
         return self.visual(pixel_values, grid_thw)
 
     def _parse_and_validate_image_input(
