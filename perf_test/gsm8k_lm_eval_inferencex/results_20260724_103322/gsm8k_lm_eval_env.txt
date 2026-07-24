@@ -1,0 +1,20 @@
+MODEL=/shared/models/deepseek-ai/DeepSeek-V4-Pro
+HOST=127.0.0.1
+PORT=8333
+CONC=64
+NUM_FEWSHOT=5
+MAX_LENGTH=9472
+MAX_TOKENS=2048
+TEMPERATURE=0
+TOP_P=1
+MAX_RETRIES=5
+TIMEOUT=1800
+TASK_YAML=/home/shashen/vllm/vllm/perf_test/gsm8k_inferencex.yaml
+OUTDIR=/home/shashen/vllm/vllm/perf_test/gsm8k_lm_eval_inferencex/results_20260724_103322
+LIMIT=
+VLLM_MODULE=/home/shashen/vllm/vllm/vllm/__init__.py
+VLLM_VERSION=0.23.1rc1.dev1442+gdd72658e7
+PYTHON=/home/shashen/vllm/vllm/.venv/bin/python
+GIT_COMMIT=d4a870e65acf36476e6a5bdd1f3d9d41465c3f58
+GIT_STATUS= M vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
+?? perf_test/gsm8k_lm_eval_inferencex/
