@@ -50,7 +50,7 @@ VLLM_MODULE="$("${VLLM_PY}" -c 'import vllm; print(vllm.__file__)' 2>/dev/null |
 VLLM_VERSION="$("${VLLM_BIN}" --version 2>&1 | head -1 || true)"
 
 # Profiling
-export PROFILE_STEPS=5
+export PROFILE_STEPS=6
 export MAX_NUM_SEQS=64
 export MAX_NUM_BATCHED_TOKENS=8192
 export PROFILE_ROOT=/home/shashen/vllm/profiles/deepseek-v4

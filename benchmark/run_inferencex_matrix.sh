@@ -12,11 +12,12 @@ export MODEL=${MODEL:-/shared/models/deepseek-ai/DeepSeek-V4-Pro}
 export PORT=${PORT:-8333}
 export ISL=${ISL:-128}
 export OSL=${OSL:-32}
-export RANDOM_RANGE_RATIO=${RANDOM_RANGE_RATIO:-0.8}
+# export RANDOM_RANGE_RATIO=${RANDOM_RANGE_RATIO:-0.8}
+export RANDOM_RANGE_RATIO=0
 export PROMPTS_MULT=${PROMPTS_MULT:-10}
 # CONCS=${CONCS:-"4 8 16 32 64"}
 # CONCS=${CONCS:-"64"}
-# local CONCS=$1
+# export CONCS=$1
 OUTDIR=${OUTDIR:-/home/shashen/vllm/vllm/benchmark/ix_8k1k/results_$(date +%Y%m%d_%H%M%S)}
 mkdir -p "${OUTDIR}"
 
