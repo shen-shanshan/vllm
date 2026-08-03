@@ -1,0 +1,13 @@
+MODEL=/shared/models/deepseek-ai/DeepSeek-V4-Pro
+PORT=8333
+ISL=128
+OSL=32
+RANDOM_RANGE_RATIO=0
+PROMPTS_MULT=1
+CONCS=64
+USE_DSV4_TEMPLATE=0
+BENCH=/home/shashen/vllm/InferenceX/utils/bench_serving/benchmark_serving.py
+OUTDIR=/home/shashen/vllm/vllm/benchmark/ix_8k1k/results_20260802_024029
+PYTHON=/home/shashen/vllm/vllm/.venv/bin/python
+VLLM_MODULE=/home/shashen/vllm/vllm/vllm/__init__.py
+CWD=/tmp

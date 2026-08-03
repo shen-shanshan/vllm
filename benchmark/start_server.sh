@@ -51,8 +51,8 @@ VLLM_VERSION="$("${VLLM_BIN}" --version 2>&1 | head -1 || true)"
 
 # Profiling
 export PROFILE_STEPS=6
-export MAX_NUM_SEQS=64
-export MAX_NUM_BATCHED_TOKENS=8192
+# export MAX_NUM_SEQS=64
+# export MAX_NUM_BATCHED_TOKENS=8192
 export PROFILE_ROOT=/home/shashen/vllm/profiles/deepseek-v4
 mkdir -p "${PROFILE_ROOT}"
 
@@ -61,7 +61,7 @@ export PROFILE_DIR="${PROFILE_ROOT}/torch/conc_${CONC}"
 rm -rf "${PROFILE_DIR}"
 mkdir -p "${PROFILE_DIR}"
 
-export PROFILER_CONFIG=$(printf '{"profiler":"torch","torch_profiler_dir":"%s","delay_iterations":1,"max_iterations":%d,"ignore_frontend":true,"torch_profiler_record_shapes":false,"torch_profiler_with_memory":false,"torch_profiler_with_stack":%s,"torch_profiler_with_flops":false,"torch_profiler_use_gzip":true,"torch_profiler_dump_cuda_time_total":true}' "${PROFILE_DIR}" "${PROFILE_STEPS}" "${WITH_STACK:-false}")
+export PROFILER_CONFIG=$(printf '{"profiler":"torch","torch_profiler_dir":"%s","delay_iterations":5,"max_iterations":%d,"ignore_frontend":true,"torch_profiler_record_shapes":false,"torch_profiler_with_memory":false,"torch_profiler_with_stack":%s,"torch_profiler_with_flops":false,"torch_profiler_use_gzip":true,"torch_profiler_dump_cuda_time_total":true}' "${PROFILE_DIR}" "${PROFILE_STEPS}" "${WITH_STACK:-false}")
 
 {
   echo "MODEL=${MODEL}"
