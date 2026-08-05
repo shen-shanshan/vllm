@@ -95,7 +95,28 @@ MODEL_CONFIGS: dict[str, VitCudagraphTestConfig] = {
                 model_arch="Llama4ForConditionalGeneration",
             ),
         },
-        marks=[pytest.mark.core_model],
+        marks=[
+            pytest.mark.core_model,
+            pytest.mark.skipif(
+                current_platform.is_rocm(),
+                reason="Llama 4 HF config is gated; not verified on ROCm",
+            ),
+        ],
+    ),
+    "gemma4": VitCudagraphTestConfig(
+        model="google/gemma-4-E2B-it",
+        image_prompt=(
+            "<bos><start_of_turn>user\n<|image|>\nWhat is in this image?<end_of_turn>\n"
+            "<start_of_turn>model\n"
+        ),
+        video_prompt=(
+            "<bos><start_of_turn>user\n<|video|>\nDescribe this video in one sentence."
+            "<end_of_turn>\n<start_of_turn>model\n"
+        ),
+        needs_video_metadata=True,
+        marks=[
+            pytest.mark.core_model,
+        ],
     ),
     "qwen2_vl": VitCudagraphTestConfig(
         model="Qwen/Qwen2-VL-2B-Instruct",
@@ -163,6 +184,19 @@ MODEL_CONFIGS: dict[str, VitCudagraphTestConfig] = {
     ),
     "qwen3_5": VitCudagraphTestConfig(
         model="Qwen/Qwen3.5-0.8B",
+        image_prompt=qwen_vl_chat_template(
+            "<|vision_start|><|image_pad|><|vision_end|>What is in this image?"
+        ),
+        video_prompt=qwen_vl_chat_template(
+            "<|vision_start|><|video_pad|><|vision_end|>"
+            "Describe this video in one sentence."
+        ),
+        needs_video_metadata=True,
+        vllm_runner_kwargs={"enable_chunked_prefill": True},
+        marks=[pytest.mark.core_model],
+    ),
+    "qwen3_5_moe": VitCudagraphTestConfig(
+        model="Qwen/Qwen3.5-35B-A3B",
         image_prompt=qwen_vl_chat_template(
             "<|vision_start|><|image_pad|><|vision_end|>What is in this image?"
         ),
@@ -249,19 +283,6 @@ MODEL_CONFIGS: dict[str, VitCudagraphTestConfig] = {
         },
         skip=True,  # TODO: Re-enable this once OOM issues are resolved on CI.
     ),
-    "gemma4": VitCudagraphTestConfig(
-        model="google/gemma-4-E2B-it",
-        image_prompt=(
-            "<bos><start_of_turn>user\n<|image|>\nWhat is in this image?<end_of_turn>\n"
-            "<start_of_turn>model\n"
-        ),
-        video_prompt=(
-            "<bos><start_of_turn>user\n<|video|>\nDescribe this video in one sentence."
-            "<end_of_turn>\n<start_of_turn>model\n"
-        ),
-        needs_video_metadata=True,
-        marks=[pytest.mark.core_model],
-    ),
 }
 
 
@@ -280,7 +301,9 @@ def get_compilation_config(config: VitCudagraphTestConfig):
 
 
 @pytest.mark.parametrize("model_id", params_with_marks(MODEL_CONFIGS))
-@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
+@pytest.mark.skipif(
+    not current_platform.is_cuda_alike(), reason="Requires CUDA or ROCm"
+)
 def test_vit_cudagraph_image(model_id, vllm_runner, image_assets):
     config = MODEL_CONFIGS[model_id]
 
@@ -324,7 +347,9 @@ def test_vit_cudagraph_image(model_id, vllm_runner, image_assets):
 
 
 @pytest.mark.parametrize("model_id", params_with_marks(MODEL_CONFIGS))
-@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
+@pytest.mark.skipif(
+    not current_platform.is_cuda_alike(), reason="Requires CUDA or ROCm"
+)
 def test_vit_cudagraph_video(model_id, vllm_runner, video_assets):
     config = MODEL_CONFIGS[model_id]
 

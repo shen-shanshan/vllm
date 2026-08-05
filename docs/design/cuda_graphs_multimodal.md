@@ -134,6 +134,43 @@ Models opt-in to encoder CUDA Graphs by implementing the [SupportsEncoderCudaGra
 !!! note
     Encoder CUDA Graphs have currently been tested with `--mm-encoder-attn-backend=FLASH_ATTN` and `--mm-encoder-attn-backend=FLASHINFER` on Blackwell GPUs.
     For Qwen2-VL and Qwen2.5-VL only FA2 and FA3 has been tested.
+    On AMD MI350X (gfx950), end-to-end validation used `--mm-encoder-attn-backend=FLASH_ATTN` (the default on ROCm). See [Validation on AMD MI350X](#validation-on-amd-mi350x) below.
+
+## Validation on AMD MI350X
+
+End-to-end validation on 8× AMD MI350X (gfx950) used
+`--mm-encoder-attn-backend=FLASH_ATTN` (the ROCm default). Smallest model
+variants were used where available.
+
+**Manual validation** ran `examples/generate/multimodal/vision_language_offline.py`
+with and without `--enable-vit-cuda-graph`, comparing CG outputs against the
+eager-encoder baseline. Remaining architectures were not manually re-run and
+are marked **Not verified** below.
+
+**Automated coverage** is provided by
+`tests/models/multimodal/generation/test_vit_cudagraph.py` on ROCm
+(`is_cuda_alike()`). On MI350X: `17 passed, 5 skipped` (see PR description
+for details).
+
+| Model (smallest tested) | Image CG | Video CG | Dual-Path | Result |
+| ----------------------- | -------- | -------- | --------- | ------ |
+| `Qwen/Qwen3.5-0.8B` | Pass | Pass | No | Verified |
+| `Qwen/Qwen2-VL-2B-Instruct` | Pass | Pass | No | Verified |
+| `Qwen/Qwen2.5-VL-3B-Instruct` | Pass | Pass | No | Verified |
+| `Qwen/Qwen3-VL-2B-Instruct` | Pass | Pass | No | Verified |
+| `Qwen/Qwen3.5-35B-A3B` (MoE) | Pass | Pass | No | Verified |
+| `zai-org/GLM-4.6V-Flash` | Pass | Pass | No | Verified |
+| `google/gemma-4-E2B-it` | Pass | — | No | Verified (image)[^manual-partial] |
+| `OpenGVLab/InternVL3-1B` | — | — | No | Not verified[^manual-skip] |
+| `moonshotai/Kimi-VL-A3B-Instruct` | — | — | No | Not verified[^manual-skip] |
+| `deepseek-ai/DeepSeek-OCR` | — | — | Yes | Not verified[^manual-skip] |
+| `stepfun-ai/Step3-VL-10B` | — | — | Yes | Not verified[^manual-skip] |
+| `google/gemma-3-4b-it` | — | — | No | Not verified[^gated] |
+| `meta-llama/Llama-4-Scout-17B-16E-Instruct` | — | — | No | Not verified[^gated] |
+
+[^manual-partial]: Manual eager/CG comparison passed for image inference only; video was not manually validated on MI350X.
+[^manual-skip]: Manual end-to-end validation was not completed on MI350X. Some of these architectures are covered by ROCm pytest in `test_vit_cudagraph.py` (see PR for results).
+[^gated]: Gated HuggingFace weights were unavailable during validation. Automated tests skip `llama4` on ROCm for the same reason.
 
 ## Configuration
 
