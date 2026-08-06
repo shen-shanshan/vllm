@@ -43,7 +43,7 @@ else
 fi
 
 # OUTDIR=${OUTDIR:-/home/shashen/vllm/vllm/dsv4_rocm_bench/inferencex_tests}
-OUTDIR=${OUTDIR:-/home/shashen/vllm/vllm/perf_test}
+OUTDIR=${OUTDIR:-/home/shashen/vllm/vllm/debug}
 # mkdir -p "${OUTDIR}"
 
 VLLM_MODULE="$("${VLLM_PY}" -c 'import vllm; print(vllm.__file__)' 2>/dev/null || true)"

@@ -815,7 +815,7 @@ def rocm_aiter_sparse_attn_indexer(
                 topk_indices.reshape(batch_size, next_n, topk_indices.shape[-1]),
                 decode_lens,
             )
-            topk_indices_buffer[: topk_indices.shape[0], : topk_indices.shape[-1]] = (
+            topk_indices_buffer[:num_decode_tokens, : topk_indices.shape[-1]] = (
                 topk_indices
             )
 

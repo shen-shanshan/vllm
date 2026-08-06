@@ -553,7 +553,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # Three aux streams for CSA kernel-level overlap in attention_impl
         # (main compressor + indexer on side streams; input GEMMs stay serial).
         # On ROCm, opt in via VLLM_ROCM_DSV4_CSA_MULTI_STREAM; sync uses
-        # Stream.wait_stream in amd/rocm.py (ATOM pattern), not CUDA Events.
+        # Stream.wait_stream via platforms/rocm.launch_multi_stream (PR #50866).
         aux_stream_list = (
             [torch.cuda.Stream() for _ in range(3)]
             if (

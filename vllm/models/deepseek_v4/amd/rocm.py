@@ -12,11 +12,11 @@ from vllm.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from vllm.forward_context import get_forward_context
-from vllm.models.deepseek_v4.amd.multi_stream import (
-    rocm_execute_in_parallel,
-    rocm_maybe_execute_in_parallel,
-)
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
+from vllm.utils.multi_stream_utils import (
+    execute_in_parallel,
+    maybe_execute_in_parallel,
+)
 from vllm.models.deepseek_v4.common.ops import dequantize_and_gather_k_cache
 from vllm.models.deepseek_v4.sparse_mla import (
     DeepseekV4FlashMLABackend,
@@ -526,7 +526,7 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
                 return q
 
-            q, _ = rocm_execute_in_parallel(
+            q, _ = execute_in_parallel(
                 wq_b_kv_insert,
                 [
                     lambda: indexer(
@@ -541,8 +541,10 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                         compressor, hidden_states, positions, self.rotary_emb
                     ),
                 ],
+                self.ln_events[0],
+                [self.ln_events[1], self.ln_events[2]],
                 [aux_streams[0], aux_streams[1]],
-                queue_aux_before_default=True,
+                enable=True,
             )
         elif self.compressor is not None:
             compressor = self.compressor
@@ -552,11 +554,13 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
                 return q
 
-            q, _ = rocm_maybe_execute_in_parallel(
+            q, _ = maybe_execute_in_parallel(
                 wq_b_kv_insert,
                 lambda: self._compressor_wkv_gate_and_forward(
                     compressor, hidden_states, positions, self.rotary_emb
                 ),
+                self.ln_events[0],
+                self.ln_events[1],
                 aux_streams[0],
             )
         else:
