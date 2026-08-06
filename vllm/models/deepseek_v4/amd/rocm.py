@@ -2,15 +2,20 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import dataclass
-from typing import cast
+from typing import Any, cast
 
 import torch
 
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
 from vllm.forward_context import get_forward_context
+from vllm.models.deepseek_v4.amd.multi_stream import (
+    rocm_execute_in_parallel,
+    rocm_maybe_execute_in_parallel,
+)
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
 from vllm.models.deepseek_v4.common.ops import dequantize_and_gather_k_cache
 from vllm.models.deepseek_v4.sparse_mla import (
@@ -451,6 +456,114 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
         # Block scale for the preshuffled weight; None = not preshuffled.
         self._wqa_wkv_scale: torch.Tensor | None = None
         self._wo_b_scale: torch.Tensor | None = None
+        # ATOM overlaps full compressor kernels in attention_impl, not via
+        # indexer-inner Event sync; keep that path serial on ROCm.
+        if self.indexer is not None and self.aux_stream_list is not None:
+            self.indexer.aux_stream = None
+
+    @staticmethod
+    def _compressor_wkv_gate_and_forward(
+        compressor: Any,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        rotary_emb: Any,
+    ) -> None:
+        """Run wkv_gate + compress kernels on a side stream (ATOM pattern)."""
+        kv_score = torch.mm(
+            hidden_states,
+            compressor.fused_wkv_wgate.weight.T,
+            out_dtype=torch.float32,
+        )
+        compressor(kv_score, positions, rotary_emb)
+
+    def attn_gemm_parallel_execute(self, hidden_states) -> tuple[Any, ...]:
+        if self.aux_stream_list is None:
+            return super().attn_gemm_parallel_execute(hidden_states)
+        # ATOM does not fan out input GEMMs; CSA overlap is in attention_impl.
+        saved_streams = self.aux_stream_list
+        self.aux_stream_list = None
+        try:
+            return super().attn_gemm_parallel_execute(hidden_states)
+        finally:
+            self.aux_stream_list = saved_streams
+
+    @eager_break_during_capture
+    def attention_impl(
+        self,
+        hidden_states: torch.Tensor,
+        qr: torch.Tensor,
+        kv: torch.Tensor,
+        kv_score: torch.Tensor,
+        indexer_kv_score: torch.Tensor,
+        indexer_weights: torch.Tensor,
+        positions: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
+        if self.aux_stream_list is None:
+            super().attention_impl(
+                hidden_states,
+                qr,
+                kv,
+                kv_score,
+                indexer_kv_score,
+                indexer_weights,
+                positions,
+                out,
+            )
+            return
+
+        forward_context = get_forward_context()
+        attn_metadata = forward_context.attn_metadata
+        aux_streams = self.aux_stream_list
+
+        if self.indexer is not None:
+            indexer = self.indexer
+            assert self.compressor is not None
+            compressor = self.compressor
+
+            def wq_b_kv_insert() -> torch.Tensor:
+                q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
+                q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
+                return q
+
+            q, _ = rocm_execute_in_parallel(
+                wq_b_kv_insert,
+                [
+                    lambda: indexer(
+                        hidden_states,
+                        qr,
+                        indexer_kv_score,
+                        indexer_weights,
+                        positions,
+                        self.indexer_rotary_emb,
+                    ),
+                    lambda: self._compressor_wkv_gate_and_forward(
+                        compressor, hidden_states, positions, self.rotary_emb
+                    ),
+                ],
+                [aux_streams[0], aux_streams[1]],
+                queue_aux_before_default=True,
+            )
+        elif self.compressor is not None:
+            compressor = self.compressor
+
+            def wq_b_kv_insert() -> torch.Tensor:
+                q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
+                q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
+                return q
+
+            q, _ = rocm_maybe_execute_in_parallel(
+                wq_b_kv_insert,
+                lambda: self._compressor_wkv_gate_and_forward(
+                    compressor, hidden_states, positions, self.rotary_emb
+                ),
+                aux_streams[0],
+            )
+        else:
+            q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
+            q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
+
+        self.forward_mqa(q, kv, positions, out)
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:

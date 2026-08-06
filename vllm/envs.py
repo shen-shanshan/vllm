@@ -141,6 +141,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_FP4BMM: bool = True
     VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION: bool = False
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
+    VLLM_ROCM_DSV4_CSA_MULTI_STREAM: bool = False
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_ROCM_FP8_PADDING: bool = True
@@ -1286,6 +1287,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # By default is disabled.
     "VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS", "False").lower()
+        in ("true", "1")
+    ),
+    # Whether to overlap DeepSeek-V4 CSA on separate HIP streams on ROCm.
+    # Disabled by default; set to 1 for overlap, 0 or unset for the serial
+    # fallback (useful for A/B perf comparison).
+    "VLLM_ROCM_DSV4_CSA_MULTI_STREAM": lambda: (
+        os.getenv("VLLM_ROCM_DSV4_CSA_MULTI_STREAM", "False").lower()
         in ("true", "1")
     ),
     # Whether to use aiter triton kernels for gemm ops.
