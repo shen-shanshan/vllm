@@ -277,8 +277,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         if self.compress_ratio == 4:
             # Only C4A uses sparse attention and hence has indexer.
             # aux_stream_list[2] is free here (outer GEMMs joined) for the inner
-            # overlap of wq_b+fused_indexer_q_rope_quant vs compressor. None on
-            # ROCm, where aux_stream_list is None.
+            # overlap of wq_b+fused_indexer_q_rope_quant vs compressor.
             indexer_aux_stream = (
                 aux_stream_list[2] if aux_stream_list is not None else None
             )
@@ -296,7 +295,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 eager_scratch_pool=eager_scratch_pool,
             )
 
-        # Will be None on ROCm for now.
         self.aux_stream_list = aux_stream_list
         # [0]: GEMM start / post-GEMM event0. [1..3]: GEMM done events;
         # [1] doubles as post-GEMM event1. Reuse is safe: GEMM fully joins
@@ -391,7 +389,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
 
         # Keep Q projection and KV insertion on the default stream. The indexer
         # and MLA compressor use aux streams 0 and 1; aux 2 is internal to the
-        # indexer. ROCm runs the same work sequentially without aux streams.
+        # indexer. Falls back to sequential when aux_streams is None.
         if indexer is not None:
             assert compressor is not None
             q, (indexer_inputs, _) = execute_in_parallel(
@@ -405,7 +403,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                         positions,
                         self.indexer_rotary_emb,
                     ),
-                    lambda: compressor(kv_score, positions, self.rotary_emb),
+                    self._compressor_side_stream_fn(
+                        compressor, kv_score, hidden_states, positions, self.rotary_emb
+                    ),
                 ],
                 self.ln_events[0],
                 [self.ln_events[1], self.ln_events[2]],
@@ -440,6 +440,17 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # Inverse-RoPE + wo_a + wo_b output projection (platform-specific).
         return self._o_proj(o, positions)
 
+    @staticmethod
+    def _compressor_side_stream_fn(
+        compressor,
+        kv_score: torch.Tensor,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        rotary_emb,
+    ) -> Callable[[], None]:
+        """Return a zero-arg callable for compressor work on a side stream."""
+        return lambda: compressor(kv_score, positions, rotary_emb)
+
     def _run_parallel_input_projections(
         self, hidden_states: torch.Tensor
     ) -> tuple[
@@ -456,7 +467,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # fused_wqa_wkv (heaviest) on default; the three lighter input GEMMs
         # on aux streams 0..2 when their owning module exists. ln_events[0]
         # is the fan-out start event; ln_events[1..3] are per-aux done events.
-        # On ROCm, aux_streams is None and execute_in_parallel runs serially.
+        # Falls back to sequential when aux_streams is None.
         aux_fns: list[Callable[[], Any] | None] = [None, None, None]
 
         if self.compressor is not None:
