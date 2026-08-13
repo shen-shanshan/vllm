@@ -419,7 +419,28 @@ class DeepseekCompressor(nn.Module):
         # cutedsl (head=512) accepts the full-cache flags; triton (indexer/AMD)
         # does not, so the two callables have different signatures.
         compress_norm_rope_store_fn: Any
-        if current_platform.is_cuda() and self.head_dim == 512:
+        if (
+            self.head_dim == 512
+            and kv_cache.dtype == torch.uint8
+            and kv_cache.ndim == 3
+            and kv_cache.shape[-1] != 584
+        ):
+            # ATOM 2-buffer fp8 pool (ROCm V4 fp8 path): the flat uint8 pool
+            # row is 640B + ring share, not the 584B packed layout, and the
+            # store must write the 2buff rows (fp8 NoPE + duplicated e8m0
+            # scales + pad into the NoPE plane, bf16 RoPE into the RoPE
+            # plane). Lazy import keeps the AMD module off the CUDA import
+            # path; the branch is shape-gated and never taken for the CUDA
+            # layouts. The two-stage split is skipped here: the 2buff store
+            # is single-pass for all tokens (correct; the split-occupancy
+            # optimization is a follow-up).
+            from vllm.models.deepseek_v4.amd.fp8_2buff import (
+                compress_norm_rope_store_2buff,
+            )
+
+            compress_norm_rope_store_fn = compress_norm_rope_store_2buff
+            extra_kwargs = {}
+        elif current_platform.is_cuda() and self.head_dim == 512:
             from .nvidia.ops.sparse_attn_compress_cutedsl import (
                 compress_norm_rope_store_cutedsl,
             )

@@ -4,6 +4,7 @@
 from dataclasses import dataclass
 from typing import cast
 
+import numpy as np
 import torch
 
 from vllm.distributed import (
@@ -11,6 +12,24 @@ from vllm.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from vllm.forward_context import get_forward_context
+from vllm.models.deepseek_v4.amd.fp8_2buff import (
+    Atom2BuffPoolViews,
+    V4RingSlotAllocator,
+    atom2buff_available,
+    atom2buff_reject_prefix_caching,
+    build_extend_indices_cpu,
+    build_ring_indices_cpu,
+    kv_splits_heuristic,
+    merge_ragged_indices,
+    ragged_from_lists,
+    rocm_fp8_2buff_decode,
+    rocm_fp8_2buff_prefill,
+    rocm_fp8_2buff_qk_norm_rope_quant,
+    slice_atom2buff_pool_views,
+    swa_ring_scatter_2buff,
+    v4_atom2buff_ring_rows_from_config,
+    v4_atom2buff_spec,
+)
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
 from vllm.models.deepseek_v4.common.ops import dequantize_and_gather_k_cache
 from vllm.models.deepseek_v4.sparse_mla import (
@@ -309,6 +328,39 @@ class DeepseekV4ROCMAiterMLASparseMetadata(DeepseekV4FlashMLAMetadata):
 
 
 @dataclass
+class DeepseekV4Atom2BuffFp8Metadata(DeepseekV4ROCMAiterMLASparseMetadata):
+    """2-buffer fp8 additions on top of the ROCm sparse metadata.
+
+    The ring/extend index streams are built host-side by the builder; the
+    compressed (CSA topk / HCA) part is translated in-forward (the topk buffer
+    is only written during forward), so the merged index arrays and indptrs
+    are assembled at forward time from the two components.
+    """
+
+    # Attached by the attention layer at forward time (before the compressor
+    # store hook reads them): dense plane views + ring geometry.
+    atom2buff_views: Atom2BuffPoolViews | None = None
+    atom2buff_ring_rows: int = 0
+    atom2buff_ring_slots: int = 0
+
+    # Decode (op5): per-token SWA ring rows + merged [comp | ring] buffers.
+    decode_ring_indices: torch.Tensor | None = None
+    decode_ring_indptr: torch.Tensor | None = None
+    decode_merged_buf: torch.Tensor | None = None
+    decode_merged_indptr_buf: torch.Tensor | None = None
+    qo_indptr: torch.Tensor | None = None
+    state_slot_per_seq: torch.Tensor | None = None
+
+    # Prefill (op4): pre-chunk ring prefix + in-chunk extend offsets.
+    prefix_ring_indices: torch.Tensor | None = None
+    prefix_ring_indptr: torch.Tensor | None = None
+    prefix_merged_buf: torch.Tensor | None = None
+    prefix_merged_indptr_buf: torch.Tensor | None = None
+    prefill_extend_indices: torch.Tensor | None = None
+    prefill_extend_indptr: torch.Tensor | None = None
+
+
+@dataclass
 class DeepseekV4ROCMAiterSparseSWAMetadata(DeepseekSparseSWAMetadata):
     decode_swa_ragged_indices: torch.Tensor | None = None
     decode_swa_ragged_indptr: torch.Tensor | None = None
@@ -445,6 +497,186 @@ class DeepseekV4ROCMAiterMLASparseBackend(DeepseekV4SparseMLABackend):
         return DeepseekV4ROCMAiterMLASparseMetadataBuilder
 
 
+class DeepseekV4Atom2BuffFp8MetadataBuilder(
+    DeepseekV4ROCMAiterMLASparseMetadataBuilder
+):
+    """Metadata builder for the ATOM 2-buffer fp8 path.
+
+    Builds (host-side, outside the captured graph) the ring/extend index
+    streams the op4/op5 kernels consume: per-token SWA ring rows (full window
+    for decode, pre-chunk prefix for prefill), in-chunk extend offsets for
+    prefill, per-request ring slots (keyed by the request's first block id --
+    stable while resident, unique across concurrent requests, no prefix
+    caching on this path), and ``qo_indptr = arange(N+1)``. The compressed
+    (CSA topk / HCA) part is translated in-forward with the fork's existing
+    ``compute_global_topk_ragged_indices_and_indptr`` (the topk buffer is only
+    written during forward), and the merged indptr is a plain GPU add of the
+    two component indptrs -- no host/device length parity to keep in sync.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        cfg = self.vllm_config
+        sched = cfg.scheduler_config
+        hf = cfg.model_config.hf_config
+        self._2b_win = int(hf.sliding_window)
+        spec = cfg.speculative_config
+        spec_steps = (
+            int(getattr(spec, "num_speculative_tokens", 0) or 0)
+            if spec is not None
+            else 0
+        )
+        self._2b_ring_slots = self._2b_win + spec_steps
+        self._2b_ring_rows = sched.max_num_seqs * self._2b_ring_slots
+        self._2b_max_comp = (
+            self.c128a_max_compressed
+            if self.compress_ratio == 128
+            else self.topk_tokens
+        )
+        max_tokens = sched.max_num_batched_tokens
+        max_seg = self._2b_win + self._2b_max_comp
+        dev = self.device
+        self._2b_decode_ring_buf = torch.empty(
+            max_tokens * self._2b_win, dtype=torch.int32, device=dev
+        )
+        self._2b_decode_ring_indptr_buf = torch.empty(
+            max_tokens + 1, dtype=torch.int32, device=dev
+        )
+        self._2b_decode_merged_buf = torch.empty(
+            max_tokens * max_seg, dtype=torch.int32, device=dev
+        )
+        self._2b_decode_merged_indptr_buf = torch.empty(
+            max_tokens + 1, dtype=torch.int32, device=dev
+        )
+        self._2b_prefix_ring_buf = torch.empty(
+            max_tokens * self._2b_win, dtype=torch.int32, device=dev
+        )
+        self._2b_prefix_ring_indptr_buf = torch.empty(
+            max_tokens + 1, dtype=torch.int32, device=dev
+        )
+        self._2b_prefix_merged_buf = torch.empty(
+            max_tokens * max_seg, dtype=torch.int32, device=dev
+        )
+        self._2b_prefix_merged_indptr_buf = torch.empty(
+            max_tokens + 1, dtype=torch.int32, device=dev
+        )
+        self._2b_extend_buf = torch.empty(
+            max_tokens * self._2b_win, dtype=torch.int32, device=dev
+        )
+        self._2b_extend_indptr_buf = torch.empty(
+            max_tokens + 1, dtype=torch.int32, device=dev
+        )
+        self._2b_qo_indptr_buf = torch.empty(
+            max_tokens + 1, dtype=torch.int32, device=dev
+        )
+        self._2b_slots_buf = torch.empty(
+            sched.max_num_seqs, dtype=torch.int32, device=dev
+        )
+        self._2b_slot_alloc = V4RingSlotAllocator(sched.max_num_seqs)
+
+    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
+    ) -> "DeepseekV4Atom2BuffFp8Metadata":
+        base = super().build(
+            common_prefix_len=common_prefix_len,
+            common_attn_metadata=common_attn_metadata,
+            fast_build=fast_build,
+        )
+        md = DeepseekV4Atom2BuffFp8Metadata(
+            **vars(base),
+            atom2buff_ring_slots=self._2b_ring_slots,
+        )
+        num_actual = common_attn_metadata.num_actual_tokens
+        num_reqs = common_attn_metadata.num_reqs
+        if num_actual == 0 or num_reqs == 0:
+            return md
+
+        qsl = common_attn_metadata.query_start_loc_cpu.tolist()
+        cu_np = np.asarray(qsl, dtype=np.int64)
+        num_computed = common_attn_metadata._num_computed_tokens_cpu
+        if num_computed is None:
+            num_computed = common_attn_metadata.seq_lens.cpu()
+        num_computed_np = np.asarray(num_computed, dtype=np.int64)[:num_reqs]
+        positions = common_attn_metadata.positions
+        assert positions is not None, "V4 2buff metadata requires positions"
+        positions_np = positions[:num_actual].cpu().numpy().astype(np.int64)
+        block_table = common_attn_metadata.block_table_tensor
+        first_blocks_np = block_table[:num_reqs, 0].cpu().numpy()
+        slots_np = self._2b_slot_alloc.slot_for([int(b) for b in first_blocks_np])
+
+        ring_lists, prefix_lists, _batch_np = build_ring_indices_cpu(
+            positions_np,
+            cu_np,
+            num_computed_np,
+            slots_np,
+            self._2b_ring_slots,
+            self._2b_win,
+        )
+        extend_lists = build_extend_indices_cpu(
+            positions_np, cu_np, num_computed_np, self._2b_win
+        )
+
+        ring_flat, ring_indptr = ragged_from_lists(ring_lists, num_actual)
+        prefix_flat, prefix_indptr = ragged_from_lists(prefix_lists, num_actual)
+        extend_flat, extend_indptr = ragged_from_lists(extend_lists, num_actual)
+        qo_indptr = np.arange(num_actual + 1, dtype=np.int32)
+
+        def _stage(dst: torch.Tensor, np_arr: np.ndarray) -> torch.Tensor:
+            n = min(np_arr.shape[0], dst.shape[0])
+            dst[:n].copy_(torch.from_numpy(np_arr[:n]).to(dst.device))
+            return dst[: np_arr.shape[0]]
+
+        md.decode_ring_indices = _stage(self._2b_decode_ring_buf, ring_flat)
+        md.decode_ring_indptr = _stage(self._2b_decode_ring_indptr_buf, ring_indptr)
+        md.prefix_ring_indices = _stage(self._2b_prefix_ring_buf, prefix_flat)
+        md.prefix_ring_indptr = _stage(
+            self._2b_prefix_ring_indptr_buf, prefix_indptr
+        )
+        md.prefill_extend_indices = _stage(self._2b_extend_buf, extend_flat)
+        md.prefill_extend_indptr = _stage(self._2b_extend_indptr_buf, extend_indptr)
+        md.qo_indptr = _stage(self._2b_qo_indptr_buf, qo_indptr)
+        md.state_slot_per_seq = _stage(self._2b_slots_buf, slots_np)
+        md.decode_merged_buf = self._2b_decode_merged_buf
+        md.prefix_merged_buf = self._2b_prefix_merged_buf
+        md.decode_merged_indptr_buf = self._2b_decode_merged_indptr_buf
+        md.prefix_merged_indptr_buf = self._2b_prefix_merged_indptr_buf
+        return md
+
+
+class DeepseekV4Atom2BuffFp8Backend(DeepseekV4ROCMAiterMLASparseBackend):
+    """Backend for the ATOM 2-buffer fp8 path.
+
+    Reuses the existing backend name on purpose: v1 dispatch is
+    ``backend_cls``-based (``AttentionLayerBase.get_attn_backend``), so no
+    registry entry is needed and ``--attention-backend`` override bookkeeping
+    keeps resolving to the registered sparse backend.
+    """
+
+    @staticmethod
+    def get_name() -> str:
+        return "ROCM_FLASHMLA_SPARSE_DSV4"
+
+    @staticmethod
+    def get_builder_cls() -> type["DeepseekV4Atom2BuffFp8MetadataBuilder"]:
+        return DeepseekV4Atom2BuffFp8MetadataBuilder
+
+    @staticmethod
+    def get_kv_cache_shape(
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str = "auto",
+    ) -> tuple[int, ...]:
+        # Flat byte pool: head_size already carries NoPE + RoPE + amortized
+        # ring bytes per token (see fp8_2buff.v4_atom2buff_spec), so the
+        # fp8_ds_mla 584B special case of the sparse backend does not apply.
+        return (num_blocks, block_size, head_size)
+
+
 class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
     """ROCm sparse MLA attention layer for DeepSeek V4."""
 
@@ -455,6 +687,41 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
         # Block scale for the preshuffled weight; None = not preshuffled.
         self._wqa_wkv_scale: torch.Tensor | None = None
         self._wo_b_scale: torch.Tensor | None = None
+
+        # ---- ATOM 2-buffer fp8 gate (env + arch + aiter kernels) ----
+        # Compressed (CSA/HCA) layers only: dense (ratio<=1) layers keep the
+        # existing SWA-cache + Triton path untouched.
+        vllm_config = kwargs.get("vllm_config") or args[0]
+        self._atom_2buff = self.compress_ratio > 1 and atom2buff_available(
+            self.kv_cache_dtype
+        )
+        self._atom2buff_ring_rows = 0
+        self._atom2buff_views_cache: tuple[int, Atom2BuffPoolViews] | None = None
+        if self._atom_2buff:
+            cache_config = vllm_config.cache_config
+            atom2buff_reject_prefix_caching(
+                getattr(cache_config, "enable_prefix_caching", False)
+            )
+            self._atom2buff_ring_rows = v4_atom2buff_ring_rows_from_config(
+                vllm_config
+            )
+            hf = vllm_config.model_config.hf_config
+            spec = vllm_config.speculative_config
+            spec_steps = (
+                int(getattr(spec, "num_speculative_tokens", 0) or 0)
+                if spec is not None
+                else 0
+            )
+            self._atom2buff_ring_slots = int(hf.sliding_window) + spec_steps
+            self._2b_topk_tokens = int(hf.index_topk)
+            # Mirror DeepseekV4SparseMLAMetadataBuilder.c128a_max_compressed
+            # (sparse_mla.py): cdiv(max_model_len, 128), 128-aligned.
+            self._2b_max_comp = (
+                (self.max_model_len + 127) // 128 + 127
+            ) // 128 * 128
+            self.backend_cls = DeepseekV4Atom2BuffFp8Backend
+        self._qkn_2buff: tuple[torch.Tensor, ...] | None = None
+        self._2b_decode_scratch: dict[str, torch.Tensor] | None = None
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
@@ -517,6 +784,87 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             )
         return super()._fused_wqa_wkv_gemm(hidden_states)
 
+    def get_kv_cache_spec(self, vllm_config):
+        if self._atom_2buff:
+            return v4_atom2buff_spec(vllm_config, self.compress_ratio)
+        return super().get_kv_cache_spec(vllm_config)
+
+    def _atom2buff_pool_views(self) -> Atom2BuffPoolViews:
+        """Dense plane views over the runner-bound 2-buffer pool.
+
+        v1 re-binds ``self.kv_cache`` every step; slicing is idempotent and
+        cached by data pointer so the views are computed once per allocation.
+        """
+        pool = self.kv_cache
+        key = pool.data_ptr()
+        cached = self._atom2buff_views_cache
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        block_size = pool.shape[1]
+        views = slice_atom2buff_pool_views(
+            pool,
+            ring_rows=self._atom2buff_ring_rows,
+            rows_per_block=block_size // self.compress_ratio,
+        )
+        self._atom2buff_views_cache = (key, views)
+        return views
+
+    def _fused_qnorm_rope_kv_insert(
+        self, q, kv, positions, attn_metadata
+    ) -> torch.Tensor:
+        if not isinstance(attn_metadata, dict) or not self._atom_2buff:
+            # Profile/dummy runs take the base path (which pads q and skips the
+            # kernels); the 2buff branch needs real per-step metadata.
+            return super()._fused_qnorm_rope_kv_insert(
+                q, kv, positions, attn_metadata
+            )
+
+        md = cast(DeepseekV4Atom2BuffFp8Metadata, attn_metadata[self.prefix])
+        swa_md = cast(
+            DeepseekV4ROCMAiterSparseSWAMetadata,
+            attn_metadata[self.swa_cache_layer.prefix],
+        )
+        views = self._atom2buff_pool_views()
+        md.atom2buff_views = views
+        md.atom2buff_ring_rows = self._atom2buff_ring_rows
+
+        q_packed, q_rope, k_packed, k_rope = rocm_fp8_2buff_qk_norm_rope_quant(
+            q,
+            kv,
+            self.kv_norm.weight.data,
+            positions,
+            self.rotary_emb.cos_sin_cache,
+            self.eps,
+            self.n_local_heads,
+            self.head_dim,
+        )
+        self._qkn_2buff = (q_packed, q_rope, k_packed, k_rope)
+
+        # Decode: scatter every token (verified + drafts) into the ring BEFORE
+        # attention -- the draft tokens attend rows written this same step.
+        # Runs inside the eager break (attention_impl), so real batch counts
+        # and dynamic shapes are fine here.
+        num_decode_tokens = swa_md.num_decode_tokens
+        if num_decode_tokens > 0:
+            num_decodes = swa_md.num_decodes
+            cu = swa_md.query_start_loc[: num_decodes + 1]
+            slots = md.state_slot_per_seq[:num_decodes]
+            write_per_batch = min(
+                swa_md.max_decode_query_len, self._atom2buff_ring_slots
+            )
+            swa_ring_scatter_2buff(
+                k_packed[:num_decode_tokens].squeeze(1),
+                k_rope[:num_decode_tokens].squeeze(1),
+                positions[:num_decode_tokens],
+                cu,
+                slots,
+                views.ring_nope,
+                views.ring_rope,
+                self._atom2buff_ring_slots,
+                write_per_batch,
+            )
+        return q
+
     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         # ROCm BF16 reference wo_a path (inverse RoPE + einsum) + wo_b.
         z = rocm_inv_rope_einsum(
@@ -568,6 +916,10 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             output.zero_()
             return
 
+        if self._atom_2buff:
+            self._forward_2buff(q, kv, positions, output, attn_metadata)
+            return
+
         assert isinstance(attn_metadata, dict)
         rocm_metadata = cast(
             DeepseekV4ROCMAiterMLASparseMetadata | None,
@@ -606,6 +958,266 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 swa_only=swa_only,
                 output=output[:num_decode_tokens],
             )
+
+    def _forward_2buff(
+        self,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        positions: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: dict,
+    ) -> None:
+        md = cast(DeepseekV4Atom2BuffFp8Metadata, attn_metadata[self.prefix])
+        swa_md = cast(
+            DeepseekV4ROCMAiterSparseSWAMetadata,
+            attn_metadata[self.swa_cache_layer.prefix],
+        )
+        qkn = self._qkn_2buff
+        assert qkn is not None
+        q_packed, q_rope, k_packed, k_rope = qkn
+        views = md.atom2buff_views
+        assert views is not None
+
+        num_decode_tokens = swa_md.num_decode_tokens
+        if num_decode_tokens > 0:
+            self._forward_2buff_decode(
+                q_packed[:num_decode_tokens],
+                q_rope[:num_decode_tokens],
+                views,
+                md,
+                swa_md,
+                output[:num_decode_tokens],
+            )
+        if swa_md.num_prefills > 0:
+            self._forward_2buff_prefill(
+                q_packed[num_decode_tokens:],
+                q_rope[num_decode_tokens:],
+                k_packed[num_decode_tokens:],
+                k_rope[num_decode_tokens:],
+                positions[num_decode_tokens:],
+                views,
+                md,
+                swa_md,
+                output[num_decode_tokens:],
+            )
+
+    def _2b_get_decode_scratch(
+        self, q_packed: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        """Preallocated GQA pad scratch for op5 (H < 16, e.g. TP8 -> 8 heads).
+
+        Runs in the eager break, so the lazy allocation is capture-safe;
+        cached on the layer for reuse. The fp8 scratch follows the quant
+        kernel's actual q_packed dtype (aiter dtypes.fp8), captured on first
+        use.
+        """
+        if self._2b_decode_scratch is None:
+            dev = q_packed.device
+            max_tokens = self.max_num_batched_tokens
+            pad_heads = 16
+            self._2b_decode_scratch = {
+                "q_packed_pad": torch.empty(
+                    (max_tokens, pad_heads, self.head_dim),
+                    dtype=q_packed.dtype,
+                    device=dev,
+                ),
+                "q_rope_pad": torch.empty(
+                    (max_tokens, pad_heads, self.rope_head_dim),
+                    dtype=torch.bfloat16,
+                    device=dev,
+                ),
+                "sink_pad": torch.empty(
+                    (pad_heads,), dtype=torch.float32, device=dev
+                ),
+                "out_pad": torch.empty(
+                    (max_tokens, pad_heads, self.head_dim),
+                    dtype=torch.bfloat16,
+                    device=dev,
+                ),
+            }
+        return self._2b_decode_scratch
+
+    def _forward_2buff_decode(
+        self,
+        q_packed: torch.Tensor,
+        q_rope: torch.Tensor,
+        views: Atom2BuffPoolViews,
+        md: DeepseekV4Atom2BuffFp8Metadata,
+        swa_md: DeepseekV4ROCMAiterSparseSWAMetadata,
+        output: torch.Tensor,
+    ) -> None:
+        ndec = q_packed.shape[0]
+        num_decodes = swa_md.num_decodes
+        block_size = md.block_size // self.compress_ratio
+        if self.compress_ratio == 4:
+            assert self.topk_indices_buffer is not None
+            is_valid = swa_md.is_valid_token[:ndec]
+            comp, comp_indptr, _ = compute_global_topk_ragged_indices_and_indptr(
+                self.topk_indices_buffer[:ndec],
+                swa_md.token_to_req_indices,
+                md.block_table[:num_decodes],
+                block_size,
+                is_valid,
+            )
+        else:
+            comp = md.c128a_decode_topk_ragged_indices
+            comp_indptr = md.c128a_decode_topk_ragged_indptr
+        comp = comp + self._atom2buff_ring_rows
+
+        ring_indices = md.decode_ring_indices
+        ring_indptr = md.decode_ring_indptr
+        assert ring_indices is not None and ring_indptr is not None
+        merged_indptr = md.decode_merged_indptr_buf[: ndec + 1]
+        torch.add(
+            comp_indptr[: ndec + 1],
+            ring_indptr[: ndec + 1],
+            out=merged_indptr,
+        )
+        merged = md.decode_merged_buf
+        assert merged is not None
+        max_seg = self._atom2buff_ring_slots + (
+            self._2b_topk_tokens if self.compress_ratio == 4 else self._2b_max_comp
+        )
+        merge_ragged_indices(
+            comp,
+            comp_indptr[: ndec + 1],
+            ring_indices,
+            ring_indptr[: ndec + 1],
+            merged,
+            merged_indptr,
+            ndec,
+            max_seg,
+        )
+
+        num_kv_splits = kv_splits_heuristic(ndec, self.n_local_heads)
+        scratch = (
+            self._2b_get_decode_scratch(q_packed) if self.n_local_heads < 16 else None
+        )
+        out = rocm_fp8_2buff_decode(
+            q_packed,
+            q_rope,
+            views.unified_nope,
+            views.unified_rope,
+            merged,
+            merged_indptr,
+            md.qo_indptr,
+            self.attn_sink,
+            self.scale,
+            num_kv_splits,
+            **(scratch or {}),
+        )
+        output.copy_(out)
+
+    def _forward_2buff_prefill(
+        self,
+        q_packed: torch.Tensor,
+        q_rope: torch.Tensor,
+        k_packed: torch.Tensor,
+        k_rope: torch.Tensor,
+        positions: torch.Tensor,
+        views: Atom2BuffPoolViews,
+        md: DeepseekV4Atom2BuffFp8Metadata,
+        swa_md: DeepseekV4ROCMAiterSparseSWAMetadata,
+        output: torch.Tensor,
+    ) -> None:
+        npref = q_packed.shape[0]
+        num_decodes = swa_md.num_decodes
+        num_decode_tokens = swa_md.num_decode_tokens
+        block_size = md.block_size // self.compress_ratio
+        if self.compress_ratio == 4:
+            assert self.topk_indices_buffer is not None
+            topk = self.topk_indices_buffer[num_decode_tokens:][:npref]
+        else:
+            topk = md.c128a_prefill_topk_indices
+        is_valid = torch.ones(npref, dtype=torch.bool, device=q_packed.device)
+        comp, comp_indptr, _ = compute_global_topk_ragged_indices_and_indptr(
+            topk,
+            swa_md.token_to_req_indices[num_decode_tokens:],
+            md.block_table[num_decodes:],
+            block_size,
+            is_valid,
+        )
+        comp = comp + self._atom2buff_ring_rows
+
+        # Rebase the prefix-ring stream to the prefill token range.
+        ring_indptr_all = md.prefix_ring_indptr
+        ring_indices_all = md.prefix_ring_indices
+        assert ring_indptr_all is not None and ring_indices_all is not None
+        base = ring_indptr_all[num_decode_tokens]
+        ring_indptr = (
+            ring_indptr_all[num_decode_tokens : num_decode_tokens + npref + 1]
+            - base
+        )
+        end = ring_indptr_all[num_decode_tokens + npref]
+        ring_indices = ring_indices_all[base:end]
+
+        # Same rebase for the extend stream (built over all tokens, decode
+        # first; op4 consumes the prefill range as [0, npref)).
+        ext_indptr_all = md.prefill_extend_indptr
+        ext_indices_all = md.prefill_extend_indices
+        assert ext_indptr_all is not None and ext_indices_all is not None
+        ext_base = ext_indptr_all[num_decode_tokens]
+        ext_indptr = (
+            ext_indptr_all[num_decode_tokens : num_decode_tokens + npref + 1]
+            - ext_base
+        )
+        ext_end = ext_indptr_all[num_decode_tokens + npref]
+        ext_indices = ext_indices_all[ext_base:ext_end]
+
+        merged_indptr = md.prefix_merged_indptr_buf[: npref + 1]
+        torch.add(comp_indptr[: npref + 1], ring_indptr, out=merged_indptr)
+        merged = md.prefix_merged_buf
+        assert merged is not None
+        max_seg = self._atom2buff_ring_slots + (
+            self._2b_topk_tokens if self.compress_ratio == 4 else self._2b_max_comp
+        )
+        merge_ragged_indices(
+            comp,
+            comp_indptr[: npref + 1],
+            ring_indices,
+            ring_indptr,
+            merged,
+            merged_indptr,
+            npref,
+            max_seg,
+        )
+
+        out = rocm_fp8_2buff_prefill(
+            q_packed,
+            q_rope,
+            views.unified_nope,
+            views.unified_rope,
+            merged,
+            merged_indptr,
+            k_packed.squeeze(1),
+            k_rope.squeeze(1),
+            ext_indices,
+            ext_indptr,
+            self.attn_sink,
+            self.scale,
+        )
+        output.copy_(out)
+
+        # Post-attention SWA ring write of the chunk tail (the in-chunk window
+        # part must not overwrite ring rows the prefill itself still reads).
+        num_prefills = swa_md.num_prefills
+        cu = swa_md.query_start_loc[num_decodes : num_decodes + num_prefills + 1]
+        cu = cu - num_decode_tokens
+        slots = md.state_slot_per_seq[num_decodes:]
+        assert swa_md.prefill_query_lens_cpu is not None
+        max_prefill_q = int(swa_md.prefill_query_lens_cpu.max())
+        write_per_batch = min(max_prefill_q, self._atom2buff_ring_slots)
+        swa_ring_scatter_2buff(
+            k_packed.squeeze(1),
+            k_rope.squeeze(1),
+            positions,
+            cu,
+            slots,
+            views.ring_nope,
+            views.ring_rope,
+            self._atom2buff_ring_slots,
+            write_per_batch,
+        )
 
     def _forward_decode(
         self,

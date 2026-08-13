@@ -12,6 +12,12 @@ ARG FA_BRANCH="jpvillam/gfx1250_wip"
 ARG FA_REPO="https://github.com/jpvillam-amd/flash-attention.git"
 ARG AITER_BRANCH="main"
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
+# Optional commit pin for the DeepSeek-V4 fp8 2-buffer path
+# (VLLM_ROCM_USE_AITER_DSV4_FP8): the op4/op5 kernels
+# (pa_sparse_prefill_fp8_opus / mla_decode_fwd_v4_nm /
+# fused_qk_norm_rope_group_quant) are validated against a specific commit;
+# leave empty to float on AITER_BRANCH.
+ARG AITER_COMMIT=""
 ARG MORI_BRANCH="v1.1.0"
 ARG MORI_REPO="https://github.com/ROCm/mori.git"
 
@@ -252,9 +258,11 @@ RUN mkdir -p /app/install; \
 FROM base AS build_aiter
 ARG AITER_BRANCH
 ARG AITER_REPO
+ARG AITER_COMMIT
 ARG USE_SCCACHE
 RUN git clone --recursive --branch ${AITER_BRANCH} ${AITER_REPO}
 RUN cd aiter \
+    && if [ -n "${AITER_COMMIT}" ]; then git checkout ${AITER_COMMIT}; fi \
     && git submodule update --init --recursive \
     && pip install -r requirements.txt
 RUN pip install pyyaml && cd aiter \
@@ -265,6 +273,14 @@ RUN pip install pyyaml && cd aiter \
     && AITER_USE_SYSTEM_TRITON=1 PREBUILD_KERNELS=${PREBUILD_KERNELS} GPU_ARCHS=${AITER_ROCM_ARCH} python3 setup.py bdist_wheel --dist-dir=dist \
     && if [ "$USE_SCCACHE" = "1" ]; then sccache --show-stats; fi \
     && ls /app/aiter/dist/*.whl
+# Verify the aiter V4 op4/op5 kernels the DeepSeek-V4 fp8 2-buffer path
+# (VLLM_ROCM_USE_AITER_DSV4_FP8) depends on are present in this build.
+RUN pip install --no-deps /app/aiter/dist/*.whl \
+    && python3 -c "import aiter.mla; \
+from aiter.ops.pa_sparse_prefill_opus import pa_sparse_prefill_fp8_opus; \
+from aiter.ops.fused_qk_norm_rope_cache_quant import fused_qk_norm_rope_group_quant; \
+assert hasattr(aiter.mla, 'mla_decode_fwd_v4_nm'); \
+print('aiter V4 op4/op5 kernels OK')"
 RUN mkdir -p /app/install && cp /app/aiter/dist/*.whl /app/install
 
 
