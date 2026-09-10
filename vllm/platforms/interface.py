@@ -1308,42 +1308,42 @@ class Platform:
         """
         return {}
 
-    @classmethod
-    def launch_multi_stream(
-        cls,
-        default_fn: Callable[[], Any],
-        aux_fns: list[Callable[[], Any] | None],
-        start_event: torch.cuda.Event,
-        done_events: list[torch.cuda.Event],
-        aux_streams: list[torch.cuda.Stream],
-        queue_aux_before_default: bool,
-    ) -> tuple[Any, list[Any]]:
-        """Launch stream work with the default CUDA event synchronization.
+    # @classmethod
+    # def launch_multi_stream(
+    #     cls,
+    #     default_fn: Callable[[], Any],
+    #     aux_fns: list[Callable[[], Any] | None],
+    #     start_event: torch.cuda.Event,
+    #     done_events: list[torch.cuda.Event],
+    #     aux_streams: list[torch.cuda.Stream],
+    #     queue_aux_before_default: bool,
+    # ) -> tuple[Any, list[Any]]:
+    #     """Launch stream work with the default CUDA event synchronization.
 
-        ROCm overrides this hook because its overlap requires stream waits.
-        """
-        aux_results: list[Any] = [None] * len(aux_fns)
-        pending: list[torch.cuda.Event] = []
+    #     ROCm overrides this hook because its overlap requires stream waits.
+    #     """
+    #     aux_results: list[Any] = [None] * len(aux_fns)
+    #     pending: list[torch.cuda.Event] = []
 
-        def launch_aux() -> None:
-            for i, fn in enumerate(aux_fns):
-                if fn is None:
-                    continue
-                with torch.cuda.stream(aux_streams[i]):
-                    start_event.wait()
-                    aux_results[i] = fn()
-                    done_events[i].record()
-                pending.append(done_events[i])
+    #     def launch_aux() -> None:
+    #         for i, fn in enumerate(aux_fns):
+    #             if fn is None:
+    #                 continue
+    #             with torch.cuda.stream(aux_streams[i]):
+    #                 start_event.wait()
+    #                 aux_results[i] = fn()
+    #                 done_events[i].record()
+    #             pending.append(done_events[i])
 
-        start_event.record()
-        if queue_aux_before_default:
-            launch_aux()
-        default_result = default_fn()
-        if not queue_aux_before_default:
-            launch_aux()
-        for event in pending:
-            event.wait()
-        return default_result, aux_results
+    #     start_event.record()
+    #     if queue_aux_before_default:
+    #         launch_aux()
+    #     default_result = default_fn()
+    #     if not queue_aux_before_default:
+    #         launch_aux()
+    #     for event in pending:
+    #         event.wait()
+    #     return default_result, aux_results
 
     @classmethod
     def num_compute_units(cls, device_id: int = 0) -> int:

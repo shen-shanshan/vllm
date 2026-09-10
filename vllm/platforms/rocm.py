@@ -1098,39 +1098,39 @@ class RocmPlatform(Platform):
     def use_custom_op_collectives(cls) -> bool:
         return True
 
-    @classmethod
-    def set_additional_forward_context(cls, *args, **kwargs) -> dict[str, Any]:
-        # Preserve the owning stream across ROCm capture and eager subregions.
-        return {"main_stream": torch.cuda.current_stream()}
+    # @classmethod
+    # def set_additional_forward_context(cls, *args, **kwargs) -> dict[str, Any]:
+    #     # Preserve the owning stream across ROCm capture and eager subregions.
+    #     return {"main_stream": torch.cuda.current_stream()}
 
-    @classmethod
-    def launch_multi_stream(
-        cls,
-        default_fn: Callable[[], Any],
-        aux_fns: list[Callable[[], Any] | None],
-        start_event: torch.cuda.Event,
-        done_events: list[torch.cuda.Event],
-        aux_streams: list[torch.cuda.Stream],
-        queue_aux_before_default: bool,
-    ) -> tuple[Any, list[Any]]:
-        # ROCm uses stream waits because event waits can hang under this overlap.
-        from vllm.forward_context import (
-            get_forward_context,
-            is_forward_context_available,
-        )
+    # @classmethod
+    # def launch_multi_stream(
+    #     cls,
+    #     default_fn: Callable[[], Any],
+    #     aux_fns: list[Callable[[], Any] | None],
+    #     start_event: torch.cuda.Event,
+    #     done_events: list[torch.cuda.Event],
+    #     aux_streams: list[torch.cuda.Stream],
+    #     queue_aux_before_default: bool,
+    # ) -> tuple[Any, list[Any]]:
+    #     # ROCm uses stream waits because event waits can hang under this overlap.
+    #     from vllm.forward_context import (
+    #         get_forward_context,
+    #         is_forward_context_available,
+    #     )
 
-        _ = start_event, done_events
-        main_stream = None
-        if is_forward_context_available():
-            main_stream = get_forward_context().additional_kwargs.get("main_stream")
-        if main_stream is None:
-            main_stream = torch.cuda.current_stream()
+    #     _ = start_event, done_events
+    #     main_stream = None
+    #     if is_forward_context_available():
+    #         main_stream = get_forward_context().additional_kwargs.get("main_stream")
+    #     if main_stream is None:
+    #         main_stream = torch.cuda.current_stream()
 
-        aux_results: list[Any] = [None] * len(aux_fns)
-        launched_streams: list[torch.cuda.Stream] = []
-        for i, fn in enumerate(aux_fns):
-            if fn is not None:
-                aux_streams[i].wait_stream(main_stream)
+    #     aux_results: list[Any] = [None] * len(aux_fns)
+    #     launched_streams: list[torch.cuda.Stream] = []
+    #     for i, fn in enumerate(aux_fns):
+    #         if fn is not None:
+    #             aux_streams[i].wait_stream(main_stream)
 
         def launch_aux() -> None:
             for i, fn in enumerate(aux_fns):
