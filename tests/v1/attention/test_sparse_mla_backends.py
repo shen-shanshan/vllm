@@ -500,7 +500,6 @@ def test_sparse_backend_decode_correctness(
     )
     model_config = vllm_config.model_config
     model_config.hf_text_config = SimpleNamespace(
-        index_topk=topk_tokens,
         q_lora_rank=None,
         kv_lora_rank=kv_lora_rank,
         qk_nope_head_dim=qk_nope_head_dim,
@@ -508,7 +507,6 @@ def test_sparse_backend_decode_correctness(
         v_head_dim=v_head_dim,
         model_type="deepseek_v2",
     )
-    del model_config.hf_config.index_topk  # Composite configs only nest this field.
     model_config.dtype = dtype
     model_config.get_num_attention_heads = MethodType(
         lambda self, parallel_config: num_heads,
@@ -670,7 +668,7 @@ def test_sparse_backend_decode_correctness(
     sdpa_reference = torch.cat(reference_outputs, dim=0)
 
     vllm_config.cache_config.cache_dtype = kv_cache_dtype
-    vllm_config.model_config.hf_text_config.index_topk = topk_tokens
+    vllm_config.model_config.hf_config.index_topk = topk_tokens
 
     common_attn_metadata = create_common_attn_metadata(
         batch_spec,
@@ -1345,7 +1343,6 @@ def test_sparse_backend_prefill_correctness(
     )
     model_config = vllm_config.model_config
     model_config.hf_text_config = SimpleNamespace(
-        index_topk=topk_tokens,
         q_lora_rank=None,
         kv_lora_rank=kv_lora_rank,
         qk_nope_head_dim=qk_nope_head_dim,
@@ -1353,7 +1350,6 @@ def test_sparse_backend_prefill_correctness(
         v_head_dim=v_head_dim,
         model_type="deepseek_v2",
     )
-    del model_config.hf_config.index_topk  # Composite configs only nest this field.
     model_config.dtype = dtype
     model_config.model_arch_config.total_num_attention_heads = num_heads
     model_config.get_num_attention_heads = MethodType(
@@ -1453,7 +1449,7 @@ def test_sparse_backend_prefill_correctness(
     ref_output = torch.cat(reference_outputs, dim=0)
 
     vllm_config.cache_config.cache_dtype = kv_cache_dtype
-    vllm_config.model_config.hf_text_config.index_topk = topk_tokens
+    vllm_config.model_config.hf_config.index_topk = topk_tokens
 
     common_attn_metadata = create_common_attn_metadata(
         batch_spec,
@@ -3531,7 +3527,6 @@ def _build_sparse_dcp_vllm_config(
     model_config = vllm_config.model_config
     model_config.dtype = torch.bfloat16
     model_config.hf_text_config = SimpleNamespace(
-        index_topk=topk_tokens,
         q_lora_rank=None,
         kv_lora_rank=kv_lora_rank,
         qk_nope_head_dim=qk_nope_head_dim,
@@ -3539,7 +3534,6 @@ def _build_sparse_dcp_vllm_config(
         v_head_dim=v_head_dim,
         model_type="deepseek_v2",
     )
-    del model_config.hf_config.index_topk  # Composite configs only nest this field.
     model_config.get_num_attention_heads = MethodType(
         lambda self, parallel_config: local_heads, model_config
     )

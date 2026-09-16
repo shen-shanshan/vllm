@@ -173,9 +173,7 @@ def test_indexer_warmup_normalizes_zero_compress_ratios():
     config = SimpleNamespace(
         scheduler_config=SimpleNamespace(max_num_batched_tokens=8),
         model_config=SimpleNamespace(
-            hf_text_config=SimpleNamespace(
-                compress_ratios=[0, 0, 4, 128, 0], index_kpool=32
-            )
+            hf_config=SimpleNamespace(compress_ratios=[0, 0, 4, 128, 0], index_kpool=32)
         ),
         parallel_config=SimpleNamespace(
             decode_context_parallel_size=1,
@@ -228,7 +226,7 @@ def test_indexer_warmup_includes_pcp_normalized_dcp_key(monkeypatch):
 def test_compressed_slot_mapping_warmup_includes_index_kpool():
     config = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=256),
-        model_config=SimpleNamespace(hf_text_config=SimpleNamespace(index_kpool=32)),
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(index_kpool=32)),
     )
 
     keys = CompressedSlotMappingKernel().get_warmup_keys(config)
@@ -240,7 +238,7 @@ def test_index_conversion_warmup_uses_physical_block_stride():
         cache_config=SimpleNamespace(block_size=64),
         model_config=SimpleNamespace(
             max_model_len=1024,
-            hf_text_config=SimpleNamespace(index_topk=2048),
+            hf_config=SimpleNamespace(index_topk=2048),
         ),
         parallel_config=SimpleNamespace(
             decode_context_parallel_size=1,
