@@ -293,14 +293,10 @@ def _gemma4_arg_converter(raw_args: str, partial: bool) -> str:
 
 
 @functools.cache
-def gemma4_config(thinking: bool = False) -> ParserEngineConfig:
+def gemma4_config() -> ParserEngineConfig:
     return ParserEngineConfig(
         name="gemma4",
         initial_state=ParserState.CONTENT,
-        # Decides a silent tail: the E-series HF templates write no marker
-        # with thinking off, and no template does after a tool response.
-        wait_for_reasoning=thinking,
-        turn_boundary_tokens=frozenset({"<|turn>", "<|tool_response>"}),
         terminals={
             "THINK_START": CHANNEL_START,
             "THINK_END": CHANNEL_END,
@@ -421,11 +417,11 @@ class Gemma4Parser(ParserEngine):
         **kwargs,
     ) -> None:
         chat_kwargs = kwargs.get("chat_template_kwargs", {}) or {}
-        thinking = chat_kwargs.get("enable_thinking", False)
+        self._thinking_enabled = chat_kwargs.get("enable_thinking", False)
         super().__init__(
             tokenizer,
             tools,
-            parser_engine_config=gemma4_config(thinking=thinking),
+            parser_engine_config=gemma4_config(),
             **kwargs,
         )
         vocab = self.vocab
@@ -475,6 +471,30 @@ class Gemma4Parser(ParserEngine):
             delta_token_ids = [self._reasoning_start_token_id, *delta_token_ids]
 
         return delta_text, delta_token_ids
+
+    def is_reasoning_end(self, input_ids: list[int]) -> bool:
+        end_id = self._reasoning_end_token_id
+        start_id = self._reasoning_start_token_id
+        tool_call_id = self._tool_call_token_id
+        new_turn_id = self._new_turn_token_id
+        tool_response_id = self._tool_response_token_id
+
+        if end_id is not None and not input_ids:
+            return self.parser_engine_config.initial_state != ParserState.REASONING
+
+        for i in range(len(input_ids) - 1, -1, -1):
+            tid = input_ids[i]
+            if start_id is not None and tid == start_id:
+                return False
+            if tool_call_id is not None and tid == tool_call_id:
+                return True
+            if new_turn_id is not None and tid == new_turn_id:
+                return not self._thinking_enabled
+            if tool_response_id is not None and tid == tool_response_id:
+                return not self._thinking_enabled
+            if end_id is not None and tid == end_id:
+                return True
+        return True
 
     def _prompt_ends_in_open_reasoning(self, prompt_token_ids: Sequence[int]) -> bool:
         """Whether the prompt tail is inside an open ``<|channel>`` block.

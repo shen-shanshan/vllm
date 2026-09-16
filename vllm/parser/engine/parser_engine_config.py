@@ -74,8 +74,6 @@ class ParserEngineConfig:
 
     initial_state: ParserState = ParserState.CONTENT
 
-    wait_for_reasoning: bool | None = None
-
     arg_converter: Callable[[str, bool], str] | None = None
 
     stream_arg_deltas: bool = True
