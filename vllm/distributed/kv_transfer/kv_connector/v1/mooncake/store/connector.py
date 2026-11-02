@@ -146,6 +146,17 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
             )
         return True
 
+    @classmethod
+    def only_restores_canonical_kv(cls, kv_transfer_config: KVTransferConfig) -> bool:
+        # Opt-in: pool keys do not fingerprint the KV cache layout, so this is
+        # only safe when no other layout can write under the same keys, e.g.
+        # one embedded-mode instance, or a distinct cache_prefix per layout.
+        return bool(
+            kv_transfer_config.get_from_extra_config(
+                "only_restores_canonical_kv", False
+            )
+        )
+
     @staticmethod
     def _validate_kv_cache_config(
         vllm_config: VllmConfig, kv_cache_config: KVCacheConfig

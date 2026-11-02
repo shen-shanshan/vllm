@@ -327,6 +327,7 @@ Strict isolation requires a Mooncake master started with `--enable_multi_tenants
   `"BAREX"` selects the BAR-exposed allocator. Unset by default. Both are
   incompatible with sleep mode and the CuMem allocator.
 - `cache_prefix` (str): Namespace prepended to every store key. Lets separate deployments share one Mooncake master without polluting each other — instances configured with different prefixes never see each other's cached blocks, even for identical prompts. All instances that should share a prefix cache must use the same value. Default: `""` (no prefix; keys are byte-identical to the unprefixed format).
+- `only_restores_canonical_kv` (bool): Declare that every KV block this instance loads was written by an instance with an identical KV cache layout, so attention backends may keep fast paths that assume no foreign bytes reach the KV cache (e.g. the aiter sparse MLA path of DeepSeek V4.1 on ROCm). Store keys do not fingerprint the layout, so only enable this when no other layout can write under the same keys: a single `embedded`-mode instance, or a distinct `cache_prefix` per layout. Default: `false`.
 - `save_decode_cache` (bool): Enable offloading decode tokens' KV cache. A `kv_consumer` does not save during prefill; when decode starts, it fills any missing block-aligned prompt prefix before appending completed decode blocks. Default: `false`.
 - `store_tp_size` (int): Common Store TP for divisible heterogeneous-TP
   sharing. See [Sharing one Store across multiple Prefill TP sizes](#sharing-one-store-across-multiple-prefill-tp-sizes).
