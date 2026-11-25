@@ -11,7 +11,9 @@ import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import VllmConfig
 from vllm.distributed import get_ep_group
+from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.forward_context import get_forward_context, is_forward_context_available
+from vllm.model_executor.layers.fused_moe.eplb_triton import eplb_map_and_record
 from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.model_executor.layers.quantization.online.base import (
     ONLINE_SHARED_EXPERT_QUANTIZERS,
@@ -20,9 +22,11 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     get_and_maybe_dequant_weights,
     kMxfp4Static,
 )
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import next_power_of_2, prev_power_of_2
+from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
 
 @triton.jit
@@ -63,6 +67,65 @@ def _expert_perm_set(vllm_config: VllmConfig) -> bool:
     return bool(getattr(akr, "expert_perm", ""))
 
 
+@triton.jit
+def _eplb_place_experts_kernel(
+    topk_ids_ptr,
+    topk_weights_ptr,
+    out_ids_ptr,
+    out_weights_ptr,
+    num_tokens,
+    logical_to_physical,
+    replica_count,
+    num_logical,
+    map_stride,
+    expert_load,
+    num_physical,
+    record_enabled,
+    num_unpadded_tokens,
+    shared_expert_id,
+    TOPK: tl.constexpr,
+    ROUTED_PER_RANK: tl.constexpr,
+    FUSE_SHARED: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    """EPLB replica mapping and load recording, plus the shared-expert route
+    of `_append_shared_expert_kernel` when `FUSE_SHARED`, in one launch."""
+    rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask = rows < num_tokens
+    out_k = TOPK + FUSE_SHARED
+    for k in tl.static_range(TOPK):
+        e = tl.load(topk_ids_ptr + rows * TOPK + k, mask=mask, other=-1)
+        p = eplb_map_and_record(
+            e,
+            rows,
+            mask,
+            logical_to_physical,
+            replica_count,
+            num_logical,
+            map_stride,
+            expert_load,
+            num_physical,
+            record_enabled,
+            num_unpadded_tokens,
+        )
+        if FUSE_SHARED:
+            p = tl.where(p >= 0, p + p // ROUTED_PER_RANK, p)
+            w = tl.load(topk_weights_ptr + rows * TOPK + k, mask=mask, other=0.0)
+            tl.store(out_weights_ptr + rows * out_k + k, w, mask=mask)
+        tl.store(out_ids_ptr + rows * out_k + k, p, mask=mask)
+    if FUSE_SHARED:
+        tl.store(
+            out_ids_ptr + rows * out_k + TOPK,
+            tl.zeros_like(rows) + shared_expert_id,
+            mask=mask,
+        )
+        tl.store(
+            out_weights_ptr + rows * out_k + TOPK,
+            tl.full([BLOCK_M], 1.0, tl.float32),
+            mask=mask,
+        )
+
+
 class DeepseekV4AiterMegaMoEExperts(nn.Module):
     # MegaMoEV2 owns large symmetric-heap buffers, so every layer shares one
     # instance and passes its own weights per call.
@@ -80,27 +143,45 @@ class DeepseekV4AiterMegaMoEExperts(nn.Module):
         intermediate_size: int,
         swiglu_limit: float | None,
         fuse_shared_expert: bool = False,
+        num_logical_experts: int | None = None,
         prefix: str = "",
     ):
+        """`num_experts` counts physical routed experts across EP ranks,
+        EPLB redundant slots included; `num_logical_experts` the checkpoint's.
+        """
         super().__init__()
         ep_group = get_ep_group()
         self.ep_rank = ep_group.rank_in_group
         self.ep_size = ep_group.world_size
+        self.num_logical_experts = (
+            num_experts if num_logical_experts is None else num_logical_experts
+        )
         # DeepSeek-V4.1 static expert placement (akr_eplb): None is the identity
         # placement; with a plan each rank holds S >= num_experts / ep slots.
+        # With EPLB the plan is also EPLB's initial placement.
         self._perm: Any = None
         if _expert_perm_set(vllm_config):
             from vllm.models.deepseek_v41.amd import akr_eplb
 
             self._perm = akr_eplb.layer_perm(
-                vllm_config, prefix, num_experts, self.ep_rank, self.ep_size
+                vllm_config,
+                prefix,
+                self.num_logical_experts,
+                self.ep_rank,
+                self.ep_size,
             )
             if self._perm is not None:
+                if self._perm.n_slots != num_experts and (
+                    num_experts != self.num_logical_experts
+                ):
+                    raise ValueError(
+                        f"{prefix}: the expert plan has {self._perm.n_slots} slots, "
+                        f"EPLB {num_experts}; set num_redundant_experts to "
+                        f"{self._perm.n_slots - self.num_logical_experts}"
+                    )
                 akr_eplb.register_aiter_profile(
                     self._perm.slots_per_rank, hidden_size, intermediate_size
                 )
-        # the router's (logical) expert count
-        self.num_logical_experts = num_experts
         # DeepSeek-V4.1 expert-load counting (akr_expert_counts), opt-in
         self._count_experts = bool(envs.VLLM_AKR_EXPERT_COUNTS)
         self.num_routed_local_experts = (
@@ -126,6 +207,7 @@ class DeepseekV4AiterMegaMoEExperts(nn.Module):
             vllm_config.scheduler_config.max_num_batched_tokens
         )
         self.prefix = prefix
+        self.eplb_state = EplbLayerState()
 
         def make_param(rows: int, cols: int) -> nn.Parameter:
             param = nn.Parameter(
@@ -157,12 +239,7 @@ class DeepseekV4AiterMegaMoEExperts(nn.Module):
                 expert_id, self.experts_start_idx, self.num_routed_local_experts
             )
         else:
-            local_expert_id = expert_id - self.experts_start_idx
-            slots = (
-                [local_expert_id]
-                if 0 <= local_expert_id < self.num_routed_local_experts
-                else []
-            )
+            slots = self._map_global_expert_id(expert_id)
         if not slots:
             return False if return_success else None
         if shard_id not in ("w1", "w2", "w3"):
@@ -176,6 +253,17 @@ class DeepseekV4AiterMegaMoEExperts(nn.Module):
                 )
             expert_data.copy_(loaded_weight.view(torch.uint8))
         return True if return_success else None
+
+    def _map_global_expert_id(self, expert_id: int) -> list[int]:
+        """Local slots that logical expert `expert_id` occupies on this rank
+        under EPLB's initial placement (physical `p` holds `p % num_logical`).
+        """
+        start = self.experts_start_idx
+        return [
+            p - start
+            for p in range(start, start + self.num_routed_local_experts)
+            if p % self.num_logical_experts == expert_id
+        ]
 
     def load_shared_expert(self, shared_experts: nn.Module) -> None:
         quantize = ONLINE_SHARED_EXPERT_QUANTIZERS[kMxfp4Static]
@@ -285,6 +373,93 @@ class DeepseekV4AiterMegaMoEExperts(nn.Module):
             f"{num_tokens} tokens exceeds MegaMoE capacity {self.max_num_tokens}"
         )
 
+    def set_eplb_state(
+        self,
+        moe_layer_idx: int,
+        expert_load_view: torch.Tensor,
+        logical_to_physical_map: torch.Tensor,
+        logical_replica_count: torch.Tensor,
+    ) -> None:
+        self.eplb_state.set_layer_state(
+            moe_layer_idx,
+            expert_load_view,
+            logical_to_physical_map,
+            logical_replica_count,
+        )
+
+    def get_expert_weights(self) -> list[torch.Tensor]:
+        """Routed-expert views EPLB migrates in place.
+
+        AITER's MXFP4 shuffles keep each expert's bytes contiguous, so an
+        expert-major view moves a whole expert; the fused shared slot is left
+        out since it is not an EPLB expert.
+        """
+        views = []
+        for name in ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale"):
+            param = getattr(self, name)
+            assert param.is_contiguous(), f"MegaMoE EPLB {name} is not contiguous"
+            views.append(
+                param.view(self.num_local_experts, -1)[: self.num_routed_local_experts]
+            )
+        return views
+
+    def update_expert_map(self) -> None:
+        pass
+
+    @property
+    def layer_id(self) -> int:
+        return extract_layer_index(self.prefix)
+
+    def place_experts(
+        self, topk_weights: torch.Tensor, topk_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Map logical routes to EPLB physical replicas, record their load and,
+        with a fused shared expert, move to the per-rank (routed + shared)
+        layout and append the shared route."""
+        state = self.eplb_state
+        mapping = state.logical_to_physical_map
+        assert mapping is not None
+        assert state.logical_replica_count is not None
+        assert state.expert_load_view is not None
+        assert state.should_record_tensor is not None
+        unpadded = state.num_unpadded_tokens_tensors
+        num_tokens = topk_ids.shape[0]
+        out_k = self.top_k
+        out_ids = torch.empty(
+            (num_tokens, out_k), dtype=topk_ids.dtype, device=topk_ids.device
+        )
+        if self.fuse_shared_expert:
+            out_weights = torch.empty(
+                (num_tokens, out_k), dtype=torch.float32, device=topk_ids.device
+            )
+        else:
+            out_weights = topk_weights
+        if num_tokens:
+            block_m = 64
+            _eplb_place_experts_kernel[(triton.cdiv(num_tokens, block_m),)](
+                topk_ids.contiguous(),
+                topk_weights.to(torch.float32).contiguous()
+                if self.fuse_shared_expert
+                else topk_weights,
+                out_ids,
+                out_weights,
+                num_tokens,
+                mapping,
+                state.logical_replica_count,
+                mapping.shape[0],
+                mapping.stride(0),
+                state.expert_load_view,
+                state.expert_load_view.numel(),
+                state.should_record_tensor,
+                None if unpadded is None else unpadded[dbo_current_ubatch_id()],
+                self.shared_expert_id,
+                TOPK=self.routed_top_k,
+                ROUTED_PER_RANK=self.num_routed_local_experts,
+                FUSE_SHARED=int(self.fuse_shared_expert),
+                BLOCK_M=block_m,
+            )
+        return out_weights, out_ids
+
     def append_shared_expert(
         self, topk_weights: torch.Tensor, topk_ids: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -324,7 +499,11 @@ class DeepseekV4AiterMegaMoEExperts(nn.Module):
             from vllm.models.deepseek_v41.amd import akr_expert_counts
 
             akr_expert_counts.count(self.prefix, self.num_logical_experts, topk_ids)
-        if self._perm is not None:
+        eplb = self.eplb_state.logical_to_physical_map is not None
+        if eplb:
+            # EPLB's replicas (and load) take the place of the static plan
+            topk_weights, topk_ids = self.place_experts(topk_weights, topk_ids)
+        elif self._perm is not None:
             # the routers' logical ids -> physical slots (owner = id // S)
             topk_ids = self._perm.remap(topk_ids)
         if self.akr is not None:
@@ -332,7 +511,7 @@ class DeepseekV4AiterMegaMoEExperts(nn.Module):
             if out is not None:
                 return out
         runtime = self.select_runtime(hidden_states.shape[0])
-        if self.fuse_shared_expert:
+        if self.fuse_shared_expert and not eplb:
             topk_weights, topk_ids = self.append_shared_expert(topk_weights, topk_ids)
         # MegaMoEV2 reads these per launch; rebind to this layer's experts.
         runtime._s1_w1 = self.w13_weight
