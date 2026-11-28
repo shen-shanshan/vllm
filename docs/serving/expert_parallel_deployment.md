@@ -268,7 +268,7 @@ Configure EPLB with the `--eplb-config` argument, which accepts a JSON string. T
 | `num_redundant_experts` | Additional experts needed to make the total divisible by EP size; computed when unset | `auto` |
 | `draft_num_redundant_experts` | Redundant expert count for a speculative MoE draft; inherits a valid target count for matching routed expert counts, otherwise computed when unset. Invalid explicit values fail validation with a suggested minimum when possible. Ignored without a speculative MoE draft. | `auto` |
 | `use_async` | Use non-blocking EPLB for reduced latency overhead | `true` |
-| `policy` | The policy type for expert parallel load balancing | `"default"` |
+| `policy` | The policy type for expert parallel load balancing: `"default"` (DeepSeek EPLB on the summed load) or `"lpt"` (longest-processing-time-first placement balancing decode and prefill load separately; ignores expert groups) | `"default"` |
 | `communicator` | Backend for expert weight transfers: `"torch_nccl"`, `"torch_gloo"`, `"pynccl"`, `"nixl"`, `"symm_mem"`, or `null` (auto) | `null` |
 
 For example:

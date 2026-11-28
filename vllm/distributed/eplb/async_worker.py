@@ -13,6 +13,7 @@ from vllm.logger import init_logger
 
 from .eplb_utils import CpuGpuEvent, device_stream
 from .migration_scheduler import schedule_migration_batches_for_layers
+from .policy.abstract import EplbStepKindStats
 from .rebalance_execute import AsyncEplbLayerResult, transfer_layer
 
 if TYPE_CHECKING:
@@ -62,6 +63,9 @@ def run_rebalance_experts(
         eplb_stats.global_expert_load_window = (
             eplb_stats.global_expert_load_window.cpu()
         )
+        if isinstance(eplb_stats, EplbStepKindStats):
+            eplb_stats.decode_load_window = eplb_stats.decode_load_window.cpu()
+            eplb_stats.prefill_load_window = eplb_stats.prefill_load_window.cpu()
     # Compute new expert mappings for the model
     new_physical_to_logical_map = eplb_state.policy.rebalance_experts(
         eplb_stats,

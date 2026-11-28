@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 import torch
@@ -519,3 +521,80 @@ def test_preserve_intragpu_slots(
         num_ranks,
         slots_per_gpu,
     )
+
+
+_C1024_COUNTS = (
+    Path(__file__).parents[1]
+    / "models/deepseek_v41/amd/data/expert_counts_agentx_c1024.npz"
+)
+_S49_PLAN = (
+    Path(__file__).parents[2]
+    / "vllm/models/deepseek_v41/amd/configs/expert_plan_S49.npz"
+)
+
+
+def _lpt_stats(decode: np.ndarray, prefill: np.ndarray, num_replicas: int):
+    from vllm.distributed.eplb.policy.abstract import EplbStepKindStats
+
+    decode_t, prefill_t = torch.from_numpy(decode), torch.from_numpy(prefill)
+    return EplbStepKindStats(
+        global_expert_load_window=decode_t + prefill_t,
+        num_replicas=num_replicas,
+        num_groups=1,
+        num_nodes=1,
+        num_gpus=8,
+        decode_load_window=decode_t,
+        prefill_load_window=prefill_t,
+    )
+
+
+def test_lpt_policy_reproduces_amd_kernels_s49_plan():
+    """On the counts the shipped DeepSeek-V4.1 plan was fitted on, the policy
+    gives that plan slot for slot."""
+    from vllm.distributed.eplb.policy import EPLB_POLICIES
+
+    counts = np.load(_C1024_COUNTS)
+    stats = _lpt_stats(counts["counts_decode"], counts["counts_prefill"], 392)
+    p2l = EPLB_POLICIES["lpt"]().rebalance_experts(stats)
+    assert np.array_equal(p2l.numpy(), np.load(_S49_PLAN)["phys2log"])
+
+
+def test_lpt_policy_keeps_slots_of_experts_that_stay():
+    from vllm.distributed.eplb.policy.lpt import LptEplbPolicy
+
+    counts = np.load(_C1024_COUNTS)
+    decode, prefill = counts["counts_decode"][:4], counts["counts_prefill"][:4]
+    policy = LptEplbPolicy()
+    old = policy.rebalance_experts(_lpt_stats(decode, prefill, 392))
+    # Same load: nothing moves.
+    same = policy.rebalance_experts(_lpt_stats(decode, prefill, 392), old)
+    assert torch.equal(same, old)
+    # Swapped objectives: a new placement, but an expert that stays on a rank
+    # keeps its slot, so only rank changes cost a transfer.
+    new = policy.rebalance_experts(_lpt_stats(prefill, decode, 392), old)
+    fresh = policy.rebalance_experts(_lpt_stats(prefill, decode, 392))
+    for layer in range(4):
+        for r in range(8):
+            o, n, f = (x[layer, r * 49 : (r + 1) * 49] for x in (old, new, fresh))
+            assert set(n.tolist()) == set(f.tolist())
+            stay = torch.isin(o, n)
+            assert torch.equal(n[stay], o[stay])
+
+
+def test_lpt_policy_without_step_kinds():
+    from vllm.distributed.eplb.policy.abstract import EplbStats
+    from vllm.distributed.eplb.policy.lpt import LptEplbPolicy
+
+    load = torch.from_numpy(np.load(_C1024_COUNTS)["counts_decode"][:2])
+    stats = EplbStats(
+        global_expert_load_window=load,
+        num_replicas=392,
+        num_groups=1,
+        num_nodes=1,
+        num_gpus=8,
+    )
+    p2l = LptEplbPolicy().rebalance_experts(stats)
+    for row in p2l:
+        assert torch.bincount(row, minlength=384).min() == 1
+        for r in range(8):
+            assert len(set(row[r * 49 : (r + 1) * 49].tolist())) == 49

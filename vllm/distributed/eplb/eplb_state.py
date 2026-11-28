@@ -54,7 +54,7 @@ from vllm.utils.torch_utils import PIN_MEMORY
 from .async_worker import start_async_worker
 from .eplb_communicator import EplbCommunicator, create_eplb_communicator
 from .eplb_utils import CpuGpuEvent
-from .policy import EPLB_POLICIES, AbstractEplbPolicy, EplbStats
+from .policy import EPLB_POLICIES, AbstractEplbPolicy, EplbStats, EplbStepKindStats
 from .rebalance_execute import (
     AsyncEplbLayerResult,
     copy_rows,
@@ -106,6 +106,22 @@ def _rank_load_imbalance(
         return 1.0
 
     return (loads_per_rank.max(dim=1).values.sum() / mean_load).item()
+
+
+def _eplb_stats(
+    load_window: torch.Tensor,
+    prefill_load_window: torch.Tensor | None,
+    **topology: int,
+) -> EplbStats:
+    """`EplbStats`, split by step kind when the prefill load is known."""
+    if prefill_load_window is None:
+        return EplbStats(global_expert_load_window=load_window, **topology)
+    return EplbStepKindStats(
+        global_expert_load_window=load_window,
+        decode_load_window=load_window - prefill_load_window,
+        prefill_load_window=prefill_load_window,
+        **topology,
+    )
 
 
 def _initial_physical_to_logical_map(model: MixtureOfExperts) -> torch.Tensor | None:
@@ -397,6 +413,16 @@ class EplbState:
         Selected EPLB algorithm
         """
         self.expert_load_window_step: int = 0
+        self.step_has_prefill: bool = False
+        """
+        Whether the current step's batch carries prefill tokens on this rank;
+        set by the model runner before the forward (`set_step_kind`).
+        """
+        self.expert_load_window_has_prefill: torch.Tensor | None = None
+        """
+        CPU bool `[window_size]`: the step kind of each load-window entry,
+        recorded only for policies with `uses_step_kind`.
+        """
         """
         Current step in the sliding window.
 
@@ -630,6 +656,10 @@ class EplbState:
         )
         expert_load_pass = expert_load_pass_buffer[:, : model.num_physical_experts]
         self.expert_load_window_size = self.parallel_config.eplb_config.window_size
+        if self.policy.uses_step_kind:
+            self.expert_load_window_has_prefill = torch.zeros(
+                self.expert_load_window_size, dtype=torch.bool
+            )
         expert_load_window = torch.zeros(
             (
                 self.expert_load_window_size,
@@ -706,6 +736,10 @@ class EplbState:
             num_unpadded_tokens_tensors=num_unpadded_tokens_tensors,
         )
         self.model_states[hash_config_cached(model_config)] = model_state
+
+    def set_step_kind(self, has_prefill: bool) -> None:
+        """Tag the coming step's load as decode-only or prefill-carrying."""
+        self.step_has_prefill = has_prefill
 
     def prepare_forward(
         self,
@@ -848,6 +882,10 @@ class EplbState:
                     eplb_model_state.expert_load_pass.zero_()
 
             if should_record:
+                if self.expert_load_window_has_prefill is not None:
+                    self.expert_load_window_has_prefill[
+                        self.expert_load_window_step
+                    ] = self.step_has_prefill
                 self.expert_load_window_step += 1
                 if self.expert_load_window_step >= self.expert_load_window_size:
                     self.expert_load_window_step = 0
@@ -1047,6 +1085,12 @@ class EplbState:
 
         # Map the physical expert load to global logical experts
         global_expert_load_windows = []
+        prefill_load_windows = []
+        has_prefill = (
+            None
+            if use_last_expert_load or self.expert_load_window_has_prefill is None
+            else self.expert_load_window_has_prefill
+        )
         for eplb_model_state in self.model_states.values():
             if use_last_expert_load:
                 # Distribute rank 0's saved counts through the existing all-reduce.
@@ -1078,8 +1122,19 @@ class EplbState:
 
             global_expert_load_window = logical_expert_load_window[..., :-1].sum(dim=0)
             global_expert_load_windows.append(global_expert_load_window)
+            if has_prefill is not None:
+                prefill_load_windows.append(
+                    logical_expert_load_window[
+                        has_prefill.to(logical_expert_load_window.device), :, :-1
+                    ].sum(dim=0)
+                )
         # Perform all-reduce to get the expert load across all ranks for each model
-        global_expert_load_windows = self._allreduce_list(global_expert_load_windows)
+        num_models = len(global_expert_load_windows)
+        reduced = self._allreduce_list(
+            global_expert_load_windows + prefill_load_windows
+        )
+        global_expert_load_windows = reduced[:num_models]
+        prefill_load_windows = reduced[num_models:] or [None] * num_models
 
         # TODO(bowen): Treat differently for prefill and decode nodes
         if rank_mapping is not None and len(rank_mapping) == ep_group.size():
@@ -1104,8 +1159,10 @@ class EplbState:
             )
 
         # Get new expert mappings
-        for eplb_model_state, global_expert_load_window in zip(
-            self.model_states.values(), global_expert_load_windows
+        for eplb_model_state, global_expert_load_window, prefill_load_window in zip(
+            self.model_states.values(),
+            global_expert_load_windows,
+            prefill_load_windows,
         ):
             model = eplb_model_state.model
             num_replicas = model.num_physical_experts
@@ -1123,9 +1180,15 @@ class EplbState:
                     old_physical_to_logical_map = (
                         eplb_model_state.physical_to_logical_map.cpu()
                     )
+                    prefill_window_cpu = (
+                        None
+                        if prefill_load_window is None
+                        else prefill_load_window.cpu()
+                    )
                 new_physical_to_logical_map = self.policy.rebalance_experts(
-                    EplbStats(
-                        global_expert_load_window=load_window_cpu,
+                    _eplb_stats(
+                        load_window_cpu,
+                        prefill_window_cpu,
                         num_replicas=num_replicas,
                         num_groups=num_groups,
                         num_nodes=num_nodes,
@@ -1189,11 +1252,14 @@ class EplbState:
                         gpu_elapsed,
                     )
             else:
-                eplb_model_state.eplb_stats = EplbStats(
+                eplb_model_state.eplb_stats = _eplb_stats(
                     # We copy the tensor to snapshot the global_expert_load_window
                     # on the main thread so that async worker can access it safely
                     # while the main thread is running.
-                    global_expert_load_window=global_expert_load_window.clone(),
+                    global_expert_load_window.clone(),
+                    None
+                    if prefill_load_window is None
+                    else prefill_load_window.clone(),
                     num_replicas=num_replicas,
                     num_groups=num_groups,
                     num_nodes=num_nodes,

@@ -23,8 +23,10 @@ objective `k` (`2d`: decode-only and prefill-carrying steps as two objectives,
 3. Slots within a rank are sorted by logical id; slot `p` lives on rank
    `p // S`.
 
-The planner assumes that an expert's load splits evenly over its replicas,
-which the runtime's per-route hash does on average. The shipped
+The placement steps are `vllm.distributed.eplb.policy.lpt`, which also runs
+them at runtime as the `lpt` EPLB policy. The planner assumes that an expert's
+load splits evenly over its replicas, which the runtime's per-route hash does
+on average. The shipped
 `configs/expert_plan_S49.npz` is
 `--slots 49 --mode 2d --draft-mode all` (draft slots 17) on the counts of
 `tests/models/deepseek_v41/amd/data/expert_counts_agentx_c1024.npz`.
@@ -41,6 +43,7 @@ import os
 
 import numpy as np
 
+from vllm.distributed.eplb.policy import lpt
 from vllm.models.deepseek_v41.amd.akr_eplb import (
     DRAFT_EXPERTS,
     TARGET_EXPERTS,
@@ -91,50 +94,26 @@ def load_counts(paths: list[str]) -> dict[str, np.ndarray]:
     return out
 
 
-def _normalise(v: np.ndarray) -> np.ndarray:
-    v = np.atleast_2d(np.asarray(v, dtype=np.float64))
-    tot = v.sum(1, keepdims=True)
-    # an empty objective counts as uniform
-    return np.where(tot > 0, v / np.where(tot > 0, tot, 1), 1.0 / v.shape[1])
-
-
 def objectives(decode: np.ndarray, prefill: np.ndarray, mode: str) -> np.ndarray:
     """One layer's normalised objectives `V [K, E]`."""
     if mode == "2d":
-        return _normalise(np.stack([decode, prefill]))
+        return lpt.objectives(decode, prefill)
     if mode == "all":
-        return _normalise(decode + prefill)
+        return lpt.objectives(decode + prefill, None)
     if mode == "decode":
-        return _normalise(decode)
+        return lpt.objectives(decode, None)
     raise ValueError(f"unknown mode {mode!r}")
 
 
 def replicate(V: np.ndarray, n_slots: int) -> np.ndarray:
     """Replica count per expert for `n_slots` slots (step 1)."""
-    n = V.shape[1]
-    if not n <= n_slots <= RANKS * n:
-        raise ValueError(f"{n_slots} slots for {n} experts on {RANKS} ranks")
-    m = V.max(0)
-    nrep = np.ones(n, dtype=np.int64)
-    for _ in range(n_slots - n):
-        nrep[int(np.argmax(np.where(nrep < RANKS, m / nrep, -1.0)))] += 1
-    return nrep
+    return lpt.replicate(V, n_slots, RANKS)
 
 
 def place(V: np.ndarray, nrep: np.ndarray, slots: int) -> np.ndarray:
     """`phys2log [RANKS * slots]` of the replicas (steps 2 and 3)."""
-    k, n = V.shape
-    m = V.max(0)
-    order = sorted((-m[x] / nrep[x], x) for x in range(n) for _ in range(nrep[x]))
-    load = np.zeros((RANKS, k))
-    held: list[set[int]] = [set() for _ in range(RANKS)]
-    for _, x in order:
-        w = V[:, x] / nrep[x]
-        free = [r for r in range(RANKS) if len(held[r]) < slots and x not in held[r]]
-        r = min(free, key=lambda i: ((load[i] + w).max(), (load[i] + w).sum(), i))
-        held[r].add(x)
-        load[r] += w
-    return np.array([x for h in held for x in sorted(h)], dtype=np.int32)
+    held = lpt.place(V, nrep, slots, RANKS)
+    return lpt.assign_slots(held, slots, None).astype(np.int32)
 
 
 def plan_layers(

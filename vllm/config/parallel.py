@@ -44,7 +44,7 @@ def get_min_num_redundant_experts(num_logical_experts: int, ep_size: int) -> int
 ExpertPlacementStrategy = Literal["linear", "round_robin"]
 DistributedExecutorBackend = Literal["ray", "mp", "uni", "external_launcher"]
 DataParallelBackend = Literal["ray", "mp"]
-EPLBPolicyOption = Literal["default"]
+EPLBPolicyOption = Literal["default", "lpt"]
 DCPCommBackend = Literal["ag_rs", "a2a"]
 DBOSchedule = Literal["dispatch-combine-overlap", "all-reduce-overlap"]
 EPLBCommunicatorBackend = Literal[
