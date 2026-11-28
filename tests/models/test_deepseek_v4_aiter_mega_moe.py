@@ -311,6 +311,53 @@ def test_eplb_place_experts_matches_reference(monkeypatch, fuse_shared_expert, r
 
 
 @pytest.mark.skipif(not current_platform.is_rocm(), reason="Requires ROCm")
+@pytest.mark.parametrize("eplb", [False, True])
+def test_eplb_replaces_static_plan_before_amd_kernels(monkeypatch, eplb):
+    """With EPLB the amd_kernels route gets EPLB's physical ids, not the static
+    plan's; without EPLB the plan remaps them."""
+    num_logical, num_physical = 384, 392
+    experts = _make_experts(
+        monkeypatch,
+        ep_rank=3,
+        ep_size=8,
+        num_experts=num_physical,
+        num_logical_experts=num_logical,
+    )
+    experts._runtimes = [(1 << 20, None)]
+    plan_ids = torch.full((5, 2), 7, dtype=torch.int32, device="cuda")
+
+    class Plan:
+        def remap(self, topk_ids):
+            assert not eplb, "the static plan must not remap under EPLB"
+            return plan_ids
+
+    captured = {}
+
+    class Akr:
+        def forward(self, hidden_states, topk_weights, topk_ids, x_quant):
+            captured["ids"] = topk_ids
+            return hidden_states
+
+    experts._perm = Plan()
+    experts.akr = Akr()
+    l2p = torch.full((num_logical, 2), -1, dtype=torch.int64, device="cuda")
+    l2p[:, 0] = torch.arange(num_logical, device="cuda").flip(0)
+    replica_count = torch.ones(num_logical, dtype=torch.int64, device="cuda")
+    if eplb:
+        load = torch.zeros(num_physical, dtype=torch.int32, device="cuda")
+        experts.set_eplb_state(0, load[None], l2p[None], replica_count[None])
+        experts.eplb_state.should_record_tensor = torch.tensor(False, device="cuda")
+
+    ids = torch.randint(0, num_logical, (5, 2), device="cuda", dtype=torch.int32)
+    hidden = torch.randn(5, HIDDEN, device="cuda")
+    out = experts.forward(hidden, torch.rand(5, 2, device="cuda"), ids)
+
+    assert out is hidden
+    expected = (num_logical - 1 - ids) if eplb else plan_ids
+    torch.testing.assert_close(captured["ids"], expected.to(ids.dtype))
+
+
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="Requires ROCm")
 @pytest.mark.parametrize("hash_routing", [False, True])
 @pytest.mark.parametrize("num_tokens", [1, 37])
 @pytest.mark.parametrize("shared_stream", [False, True])

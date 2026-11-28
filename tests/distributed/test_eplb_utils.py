@@ -701,3 +701,79 @@ def test_rocm_rearrange_gate_uses_per_layer_imbalance(
     state.rearrange()
 
     assert rearrange_weights.called == expect_rearrange
+
+
+class _PlannedEplbTestModel(_EplbTestModel):
+    """Two MoE layers whose weights were loaded in a per-layer placement."""
+
+    def __init__(self, initial: torch.Tensor | None):
+        super().__init__(num_experts=4, num_redundant=2)
+        self.num_moe_layers = 2
+        self.expert_weights = [
+            [torch.zeros(self.num_local_physical_experts, 1)] for _ in range(2)
+        ]
+        self._initial = initial
+
+    def initial_physical_to_logical_map(self) -> torch.Tensor | None:
+        return self._initial
+
+
+def _add_planned_model(monkeypatch, initial: torch.Tensor | None):
+    monkeypatch.setattr(
+        parallel_config_module.current_platform, "supports_eplb", lambda: True
+    )
+    parallel_config = ParallelConfig(
+        tensor_parallel_size=2,
+        distributed_executor_backend="mp",
+        enable_expert_parallel=True,
+        enable_eplb=True,
+        eplb_config=EPLBConfig(
+            window_size=4, step_interval=8, use_async=False, communicator="torch_gloo"
+        ),
+    )
+    monkeypatch.setattr(eplb_state_module, "CpuGpuEvent", _EplbTestEvent)
+    group = _EplbTestGroup()
+    monkeypatch.setattr(eplb_state_module, "get_ep_group", lambda: group)
+    monkeypatch.setattr(eplb_state_module, "get_eplb_group", lambda: group)
+    monkeypatch.setattr(
+        eplb_state_module,
+        "create_eplb_communicator",
+        lambda *args, **kwargs: SimpleNamespace(owned_expert_buffer=None),
+    )
+    monkeypatch.setattr(eplb_state_module, "PIN_MEMORY", False)
+    state = EplbState(parallel_config, torch.device("cpu"))
+    model_config = _EplbTestModelConfig("planned")
+    state.add_model(_PlannedEplbTestModel(initial), model_config)
+    return state.model_states[hash_config_cached(model_config)]
+
+
+def test_add_model_uses_model_initial_placement(monkeypatch):
+    # 6 slots over 2 ranks; layer 0 replicates expert 3, layer 1 expert 0 twice.
+    initial = torch.tensor([[3, 0, 1, 2, 3, 1], [0, 2, 0, 1, 3, 0]])
+    model_state = _add_planned_model(monkeypatch, initial)
+
+    assert torch.equal(model_state.physical_to_logical_map, initial)
+    assert torch.equal(
+        model_state.logical_replica_count, torch.tensor([[1, 2, 1, 2], [3, 1, 1, 1]])
+    )
+    # [layers, logical, num_redundant + 1] with -1 past each expert's replicas
+    assert model_state.logical_to_physical_map.shape == (2, 4, 3)
+    assert model_state.logical_to_physical_map[0, 3].tolist() == [0, 4, -1]
+    assert model_state.logical_to_physical_map[1, 0].tolist() == [0, 2, 5]
+
+
+def test_add_model_without_initial_placement_keeps_default(monkeypatch):
+    model_state = _add_planned_model(monkeypatch, None)
+    assert model_state.physical_to_logical_map.tolist() == [[0, 1, 2, 3, 0, 1]] * 2
+
+
+@pytest.mark.parametrize(
+    "initial",
+    [
+        torch.tensor([[0, 1, 2, 3, 0, 1]]),  # one layer short
+        torch.tensor([[0, 1, 2, 0, 1, 2], [0, 1, 2, 3, 0, 1]]),  # expert 3 left out
+    ],
+)
+def test_add_model_rejects_bad_initial_placement(monkeypatch, initial):
+    with pytest.raises(ValueError, match="initial_physical_to_logical_map"):
+        _add_planned_model(monkeypatch, initial)

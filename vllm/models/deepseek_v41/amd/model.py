@@ -1610,6 +1610,23 @@ class DeepseekV4MixtureOfExperts(MixtureOfExperts):
         self.num_shared_experts = example_moe.n_shared_experts
         self.num_redundant_experts = example_moe.n_redundant_experts
 
+    def initial_physical_to_logical_map(self) -> torch.Tensor | None:
+        """EPLB's starting placement: the static expert plan
+        (`kernel_config.amd_kernels.expert_perm`) the MegaMoE weights were
+        loaded in, or None without one."""
+        perms = [getattr(moe.experts, "_perm", None) for moe in self.moe_mlp_layers]
+        if all(p is None for p in perms):
+            return None
+        from vllm.distributed.eplb.eplb_state import EplbState
+
+        default = EplbState.build_initial_global_physical_to_logical_map(
+            self.num_logical_experts, self.num_redundant_experts
+        )
+        return torch.tensor(
+            [default if p is None else p.phys2log.tolist() for p in perms],
+            dtype=torch.int64,
+        )
+
     def update_physical_experts_metadata(
         self,
         num_physical_experts: int,

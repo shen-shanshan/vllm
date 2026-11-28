@@ -189,6 +189,13 @@ class DeepseekV4AiterMegaMoEExperts(nn.Module):
             if self._perm is None
             else self._perm.slots_per_rank
         )
+        if self._perm is None and num_experts != self.num_logical_experts:
+            # EPLB redundant slots give the same replica geometry as a plan
+            from vllm.models.deepseek_v41.amd import akr_eplb
+
+            akr_eplb.register_aiter_profile(
+                self.num_routed_local_experts, hidden_size, intermediate_size
+            )
         self.experts_start_idx = self.ep_rank * self.num_routed_local_experts
         # A fused shared expert is one extra local expert per rank and one
         # extra route per token, to the token's own rank.

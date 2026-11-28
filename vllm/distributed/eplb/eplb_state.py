@@ -108,6 +108,36 @@ def _rank_load_imbalance(
     return (loads_per_rank.max(dim=1).values.sum() / mean_load).item()
 
 
+def _initial_physical_to_logical_map(model: MixtureOfExperts) -> torch.Tensor | None:
+    """The model's own starting placement, if it has one.
+
+    A model whose weights are loaded in a non-default placement (for example a
+    static expert plan with replicas) may define
+    `initial_physical_to_logical_map()` returning a CPU int64 tensor
+    `[num_moe_layers, num_physical_experts]`, the logical expert of each
+    physical slot (slot `p` on EP rank `p // num_local_physical_experts`), or
+    None. Without it every layer starts from
+    `build_initial_global_physical_to_logical_map`.
+    """
+    fn = getattr(model, "initial_physical_to_logical_map", None)
+    initial = fn() if callable(fn) else None
+    if initial is None:
+        return None
+    initial = initial.to(device="cpu", dtype=torch.int64)
+    expected = (model.num_moe_layers, model.num_physical_experts)
+    if tuple(initial.shape) != expected:
+        raise ValueError(
+            f"initial_physical_to_logical_map has shape {tuple(initial.shape)}, "
+            f"expected {expected}"
+        )
+    counts = torch.zeros(
+        (expected[0], model.num_logical_experts), dtype=torch.int64
+    ).scatter_add_(1, initial, torch.ones_like(initial))
+    if bool((counts == 0).any()):
+        raise ValueError("initial_physical_to_logical_map leaves a logical expert out")
+    return initial
+
+
 @dataclass(slots=True)
 class EplbModelState:
     """EPLB metrics."""
@@ -543,36 +573,55 @@ class EplbState:
             logical_to_physical_map[logical_idx, logical_replica_count[logical_idx]] = i
             logical_replica_count[logical_idx] += 1
 
-        # Duplicate initial mapping for all layers
-        physical_to_logical_map = (
-            physical_to_logical_map.unsqueeze(0)
-            .expand(
-                model.num_moe_layers,
-                -1,
+        initial_map = _initial_physical_to_logical_map(model)
+        if initial_map is not None:
+            # The model loaded its weights in its own per-layer placement.
+            if self.parallel_config.enable_elastic_ep:
+                raise NotImplementedError(
+                    "Elastic EP does not support a model-provided initial "
+                    "EPLB placement."
+                )
+            logical_to_physical_map, logical_replica_count = compute_logical_maps(
+                initial_map, model.num_logical_experts
             )
-            .contiguous()
-        )
+            logical_to_physical_map = torch.nn.functional.pad(
+                logical_to_physical_map,
+                (0, max_slots_per_logical_expert - logical_to_physical_map.shape[-1]),
+                value=-1,
+            ).to(self.device)
+            logical_replica_count = logical_replica_count.to(self.device)
+            physical_to_logical_map = initial_map.to(self.device)
+        else:
+            # Duplicate initial mapping for all layers
+            physical_to_logical_map = (
+                physical_to_logical_map.unsqueeze(0)
+                .expand(
+                    model.num_moe_layers,
+                    -1,
+                )
+                .contiguous()
+            )
+            logical_to_physical_map = (
+                logical_to_physical_map.unsqueeze(0)
+                .expand(
+                    model.num_moe_layers,
+                    -1,
+                    -1,
+                )
+                .contiguous()
+            )
+            logical_replica_count = (
+                logical_replica_count.unsqueeze(0)
+                .expand(
+                    model.num_moe_layers,
+                    -1,
+                )
+                .contiguous()
+            )
         physical_to_logical_map_buffer = physical_to_logical_map
         physical_to_logical_map = physical_to_logical_map_buffer[
             :, : model.num_physical_experts
         ]
-        logical_to_physical_map = (
-            logical_to_physical_map.unsqueeze(0)
-            .expand(
-                model.num_moe_layers,
-                -1,
-                -1,
-            )
-            .contiguous()
-        )
-        logical_replica_count = (
-            logical_replica_count.unsqueeze(0)
-            .expand(
-                model.num_moe_layers,
-                -1,
-            )
-            .contiguous()
-        )
 
         expert_load_pass_buffer = torch.zeros(
             (model.num_moe_layers, physical_expert_capacity),
