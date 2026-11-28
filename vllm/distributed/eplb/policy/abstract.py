@@ -36,7 +36,23 @@ class EplbStats:
     """
 
 
+@dataclass(slots=True)
+class EplbStepKindStats(EplbStats):
+    """`EplbStats` with the load window split by step kind, for policies that
+    set `uses_step_kind`. Each rank counts its own steps: a step is a prefill
+    step on a rank when that rank's batch carried prefill tokens."""
+
+    decode_load_window: torch.Tensor
+    """Load of the decode-only steps, same shape as the summed window."""
+    prefill_load_window: torch.Tensor
+    """Load of the prefill-carrying steps, same shape as the summed window."""
+
+
 class AbstractEplbPolicy(ABC):
+    uses_step_kind: bool = False
+    """Whether the policy wants `EplbStepKindStats`: EPLB then records the
+    step kind of every load-window entry."""
+
     @abstractmethod
     def rebalance_experts(
         self,

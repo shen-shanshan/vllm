@@ -704,3 +704,99 @@ def test_rocm_rearrange_gate_uses_per_layer_imbalance(
     state.rearrange()
 
     assert rearrange_weights.called == expect_rearrange
+
+
+class _PlannedEplbTestModel(_EplbTestModel):
+    """Two MoE layers whose weights were loaded in a per-layer placement."""
+
+    def __init__(self, initial: torch.Tensor | None):
+        super().__init__(num_experts=4, num_redundant=2)
+        self.num_moe_layers = 2
+        self.expert_weights = [
+            [torch.zeros(self.num_local_physical_experts, 1)] for _ in range(2)
+        ]
+        self._initial = initial
+
+    def initial_physical_to_logical_map(self) -> torch.Tensor | None:
+        return self._initial
+
+
+class _StepKindCapturePolicy(AbstractEplbPolicy):
+    uses_step_kind = True
+
+    def __init__(self):
+        self.stats: list[EplbStats] = []
+
+    def rebalance_experts(
+        self,
+        stats: EplbStats,
+        old_global_expert_indices: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        self.stats.append(stats)
+        assert old_global_expert_indices is not None
+        return old_global_expert_indices
+
+
+def test_rearrange_splits_load_window_by_step_kind(monkeypatch):
+    """Policies with uses_step_kind get the decode-only and prefill-carrying
+    steps' load separately; the step kind comes from set_step_kind."""
+    from vllm.distributed.eplb.policy.abstract import EplbStepKindStats
+
+    monkeypatch.setattr(
+        parallel_config_module.current_platform, "supports_eplb", lambda: True
+    )
+    parallel_config = ParallelConfig(
+        tensor_parallel_size=2,
+        distributed_executor_backend="mp",
+        enable_expert_parallel=True,
+        enable_eplb=True,
+        eplb_config=EPLBConfig(
+            window_size=4,
+            step_interval=1000,
+            use_async=False,
+            communicator="torch_gloo",
+        ),
+    )
+    monkeypatch.setattr(eplb_state_module, "CpuGpuEvent", _EplbTestEvent)
+    group = _EplbTestGroup()
+    monkeypatch.setattr(eplb_state_module, "get_ep_group", lambda: group)
+    monkeypatch.setattr(eplb_state_module, "get_eplb_group", lambda: group)
+    monkeypatch.setattr(eplb_state_module, "get_node_count", lambda: 1)
+    monkeypatch.setattr(eplb_state_module, "all_reduce", lambda tensor, group: None)
+    monkeypatch.setattr(
+        eplb_state_module,
+        "create_eplb_communicator",
+        lambda *args, **kwargs: SimpleNamespace(owned_expert_buffer=None),
+    )
+    monkeypatch.setattr(
+        eplb_state_module, "rearrange_expert_weights_inplace", MagicMock()
+    )
+    monkeypatch.setattr(eplb_state_module, "PIN_MEMORY", False)
+    state = EplbState(parallel_config, torch.device("cpu"))
+    policy = _StepKindCapturePolicy()
+    state.policy = policy
+    model_config = _EplbTestModelConfig("kinds")
+    state.add_model(_PlannedEplbTestModel(None), model_config)
+    model_state = state.model_states[hash_config_cached(model_config)]
+
+    # Record the last window_size steps before the rearrangement they trigger.
+    state.expert_rearrangement_step = 1000 - 4
+    # Physical slots [0, 1, 2, 3, 0, 1]: slots 4 and 5 replicate experts 0, 1.
+    steps = [
+        (False, [1, 0, 0, 0, 1, 0]),
+        (True, [0, 2, 0, 0, 0, 0]),
+        (False, [0, 0, 3, 0, 0, 0]),
+        (True, [0, 0, 0, 4, 0, 5]),
+    ]
+    for has_prefill, load in steps:
+        state.set_step_kind(has_prefill)
+        model_state.expert_load_pass.copy_(torch.tensor([load, load]))
+        state.step()
+
+    (stats,) = policy.stats
+    assert isinstance(stats, EplbStepKindStats)
+    decode = torch.tensor([[2, 0, 3, 0]] * 2)
+    prefill = torch.tensor([[0, 7, 0, 4]] * 2)
+    assert torch.equal(stats.decode_load_window, decode)
+    assert torch.equal(stats.prefill_load_window, prefill)
+    assert torch.equal(stats.global_expert_load_window, decode + prefill)
