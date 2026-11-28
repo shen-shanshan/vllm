@@ -125,6 +125,26 @@ def _eplb_stats(
     )
 
 
+def _gate_imbalance(
+    logical_loads: torch.Tensor,
+    prefill_loads: torch.Tensor | None,
+    physical_to_logical_map: torch.Tensor,
+    ep_size: int,
+) -> float:
+    """The rearrange gate's imbalance. With the load split by step kind, the
+    worse of the decode-only and prefill-carrying steps' imbalance: those steps
+    can be imbalanced on different ranks while their sum looks balanced, and
+    a step-kind policy balances each of them."""
+    if prefill_loads is None:
+        return _rank_load_imbalance(logical_loads, physical_to_logical_map, ep_size)
+    return max(
+        _rank_load_imbalance(
+            logical_loads - prefill_loads, physical_to_logical_map, ep_size
+        ),
+        _rank_load_imbalance(prefill_loads, physical_to_logical_map, ep_size),
+    )
+
+
 @dataclass(slots=True)
 class EplbModelState:
     """EPLB metrics."""
@@ -1158,22 +1178,29 @@ class EplbState:
                     and rank_mapping is None
                     and bool((old_physical_to_logical_map >= 0).all())
                 ):
-                    current_imbalance = _rank_load_imbalance(
-                        load_window_cpu, old_physical_to_logical_map, ep_group.size()
+                    current_imbalance = _gate_imbalance(
+                        load_window_cpu,
+                        prefill_window_cpu,
+                        old_physical_to_logical_map,
+                        ep_group.size(),
                     )
-                    proposed_imbalance = _rank_load_imbalance(
-                        load_window_cpu, new_physical_to_logical_map, ep_group.size()
+                    proposed_imbalance = _gate_imbalance(
+                        load_window_cpu,
+                        prefill_window_cpu,
+                        new_physical_to_logical_map,
+                        ep_group.size(),
                     )
                     relative_improvement = (
                         current_imbalance - proposed_imbalance
                     ) / current_imbalance
                     skip_rearrange = relative_improvement < 0.05
-                    if skip_rearrange and is_main_rank:
+                    if is_main_rank:
                         logger.info(
-                            "[EPLB] Skip rearrange: imbalance %.4f -> "
-                            "%.4f (no material gain)",
+                            "[EPLB] %s: imbalance %.4f -> %.4f%s",
+                            "Skip rearrange" if skip_rearrange else "Rearrange",
                             current_imbalance,
                             proposed_imbalance,
+                            " (no material gain)" if skip_rearrange else "",
                         )
 
                 if not skip_rearrange:

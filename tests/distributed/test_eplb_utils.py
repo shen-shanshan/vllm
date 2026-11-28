@@ -800,3 +800,65 @@ def test_rearrange_splits_load_window_by_step_kind(monkeypatch):
     assert torch.equal(stats.decode_load_window, decode)
     assert torch.equal(stats.prefill_load_window, prefill)
     assert torch.equal(stats.global_expert_load_window, decode + prefill)
+
+
+class _SwapMiddleStepKindPolicy(_SwapMiddleExpertsPolicy):
+    uses_step_kind = True
+
+
+@pytest.mark.parametrize(
+    ("policy_cls", "expect_rearrange"),
+    [(_SwapMiddleStepKindPolicy, True), (_SwapMiddleExpertsPolicy, False)],
+)
+def test_rocm_rearrange_gate_sees_step_kinds(monkeypatch, policy_cls, expect_rearrange):
+    """Decode steps load rank 0 and prefill steps rank 1, so their sum is
+    balanced. A step-kind policy's swap balances each kind and passes the
+    gate; without step kinds the gate sees no gain."""
+    monkeypatch.setattr(
+        parallel_config_module.current_platform, "supports_eplb", lambda: True
+    )
+    parallel_config = ParallelConfig(
+        tensor_parallel_size=2,
+        distributed_executor_backend="mp",
+        enable_expert_parallel=True,
+        enable_eplb=True,
+        eplb_config=EPLBConfig(
+            window_size=4, step_interval=8, use_async=False, communicator="torch_gloo"
+        ),
+    )
+    monkeypatch.setattr(eplb_state_module, "CpuGpuEvent", _EplbTestEvent)
+    group = _EplbTestGroup()
+    monkeypatch.setattr(eplb_state_module, "get_ep_group", lambda: group)
+    monkeypatch.setattr(eplb_state_module, "get_eplb_group", lambda: group)
+    monkeypatch.setattr(eplb_state_module, "get_node_count", lambda: 1)
+    monkeypatch.setattr(eplb_state_module, "all_reduce", lambda tensor, group: None)
+    monkeypatch.setattr(
+        eplb_state_module,
+        "create_eplb_communicator",
+        lambda *args, **kwargs: SimpleNamespace(owned_expert_buffer=None),
+    )
+    rearrange_weights = MagicMock()
+    monkeypatch.setattr(
+        eplb_state_module, "rearrange_expert_weights_inplace", rearrange_weights
+    )
+    monkeypatch.setattr(eplb_state_module, "PIN_MEMORY", False)
+    monkeypatch.setattr(eplb_state_module.current_platform, "is_rocm", lambda: True)
+
+    state = EplbState(parallel_config, torch.device("cpu"))
+    state.policy = policy_cls()
+    model = _EplbTestModel(num_experts=4, num_redundant=0)
+    model.num_moe_layers = 2
+    model.expert_weights = [
+        [torch.zeros(model.num_local_physical_experts, 1)] for _ in range(2)
+    ]
+    model_config = _EplbTestModelConfig("target")
+    state.add_model(model, model_config)
+    model_state = state.model_states[hash_config_cached(model_config)]
+    model_state.expert_load_window[0] = torch.tensor([[3, 3, 1, 1]] * 2)
+    model_state.expert_load_window[1] = torch.tensor([[1, 1, 3, 3]] * 2)
+    if state.expert_load_window_has_prefill is not None:
+        state.expert_load_window_has_prefill[1] = True
+
+    state.rearrange()
+
+    assert rearrange_weights.called == expect_rearrange
