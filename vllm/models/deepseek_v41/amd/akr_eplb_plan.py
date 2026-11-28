@@ -112,8 +112,7 @@ def replicate(V: np.ndarray, n_slots: int) -> np.ndarray:
 
 def place(V: np.ndarray, nrep: np.ndarray, slots: int) -> np.ndarray:
     """`phys2log [RANKS * slots]` of the replicas (steps 2 and 3)."""
-    held = lpt.place(V, nrep, slots, RANKS)
-    return lpt.assign_slots(held, slots, None).astype(np.int32)
+    return lpt.place(V, nrep, slots, RANKS).astype(np.int32)
 
 
 def plan_layers(
